@@ -1,0 +1,14 @@
+# Build tree and downloaded sources
+/work/
+
+# Downloaded at flash time (scripts/flash-sensor.sh)
+/flash/firmware/
+
+# Raw fingerprint images: never commit
+/dump-dac/
+*.pgm
+*.bin
+raw-*
+
+__pycache__/
+*.pyc

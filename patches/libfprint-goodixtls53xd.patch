@@ -1,0 +1,2775 @@
+diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/drivers/goodixtls/goodix53xd.c libfprint/libfprint/drivers/goodixtls/goodix53xd.c
+--- a/libfprint/drivers/goodixtls/goodix53xd.c
++++ b/libfprint/drivers/goodixtls/goodix53xd.c
+@@ -0,0 +1,912 @@
++// Goodix Tls driver for libfprint: 53xd sensors (27c6:532d)
++
++// This library is free software; you can redistribute it and/or
++// modify it under the terms of the GNU Lesser General Public
++// License as published by the Free Software Foundation; either
++// version 2.1 of the License, or (at your option) any later version.
++
++// This library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++// Lesser General Public License for more details.
++
++// You should have received a copy of the GNU Lesser General Public
++// License along with this library; if not, write to the Free Software
++// Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++
++// Command sequence follows goodix-fp-dump's driver_53xd.py; DAC and
++// finger-lift values were measured on a Dell XPS 13 9310 2-in-1.
++
++#define FP_COMPONENT "goodixtls53xd"
++
++#include <glib.h>
++#include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "drivers_api.h"
++#include "fpi-byte-utils.h"
++#include "goodix.h"
++#include "goodix5xx.h"
++#include "goodix_proto.h"
++#include "goodix53xd.h"
++
++#define GOODIX53XD_WIDTH 64
++#define GOODIX53XD_HEIGHT 80
++#define GOODIX53XD_FRAME_SIZE (GOODIX53XD_WIDTH * GOODIX53XD_HEIGHT)
++// 4 pixels are packed in 6 bytes; the decrypted frame has a 4 byte trailer
++#define GOODIX53XD_RAW_FRAME_SIZE (GOODIX53XD_FRAME_SIZE / 4 * 6)
++// Upscale factor; with SIGFM 2x separated genuine and impostor scores best
++// (3x and 4x let some impostors score very high)
++#define GOODIX53XD_SCALE 2
++// Local contrast normalization window radius, see build_image()
++#define GOODIX53XD_NORM_RADIUS 3
++
++#define GOODIX53XD_CMD_MCU_SWITCH_TO_SLEEP_MODE (0x60)
++
++// One DAC step moves the readout by ~70 counts. At 0x10c an empty sensor
++// reads ~3640; a firmly pressed finger pulls the median down to 300-600.
++#define GOODIX53XD_DAC_BASE (0x10c)
++
++#define GOODIX53XD_REG_IMAGE (0x022c)
++#define GOODIX53XD_REG_IMAGE_ON (0x030a)
++#define GOODIX53XD_REG_IMAGE_OFF (0x020a)
++
++// A frame whose median is above this has no finger on it. Sessions often
++// start with the finger still on the sensor (e.g. between enroll stages), so
++// only such frames may become the background.
++#define GOODIX53XD_EMPTY_MEDIAN (3000)
++// Flat background used until an empty frame has been seen
++#define GOODIX53XD_EMPTY_LEVEL (3640)
++
++// A pixel is touched if the finger lowered it by this much from background
++#define GOODIX53XD_TOUCH_DELTA (600)
++#define GOODIX53XD_LIFT_POLL_MS (100)
++#define GOODIX53XD_TLS_SETTLE_MS (20)
++#define GOODIX53XD_FLUSH_MS (100)
++
++// FDT reports the very first contact, so keep sampling until the finger has
++// settled: coverage unchanged for GOODIX53XD_PRESS_STABLE_POLLS frames, or
++// give up after GOODIX53XD_PRESS_MAX_POLLS and use the best frame seen.
++#define GOODIX53XD_PRESS_MIN_COVERAGE (0.3)
++#define GOODIX53XD_PRESS_STABLE_DELTA (0.03)
++#define GOODIX53XD_PRESS_STABLE_POLLS (3)
++#define GOODIX53XD_PRESS_POLL_MS (50)
++#define GOODIX53XD_PRESS_MAX_POLLS (10)
++
++struct _FpiDeviceGoodixTls53xd
++{
++  FpiDeviceGoodixTls5xx parent;
++
++  FpiSsm               *scan_ssm;
++  gboolean              lifted;
++  gboolean              pressed;
++  gint                  press_polls;
++  gdouble               last_coverage;
++  gint                  stable_polls;
++  gboolean              scan_delayed; // a delayed transition is pending
++  gdouble               best_coverage;
++  // Kept across activations; only ever filled from finger-free frames
++  gboolean              background_valid;
++  GoodixTls5xxPix       background[GOODIX53XD_FRAME_SIZE];
++  GoodixTls5xxPix       frame[GOODIX53XD_FRAME_SIZE];
++  GoodixTls5xxPix       best_frame[GOODIX53XD_FRAME_SIZE];
++};
++
++G_DECLARE_FINAL_TYPE (FpiDeviceGoodixTls53xd, fpi_device_goodixtls53xd, FPI,
++                      DEVICE_GOODIXTLS53XD, FpiDeviceGoodixTls5xx);
++
++G_DEFINE_TYPE (FpiDeviceGoodixTls53xd, fpi_device_goodixtls53xd,
++               FPI_TYPE_DEVICE_GOODIXTLS5XX);
++
++// ---- HELPERS SECTION START ----
++
++static void
++send_fdt (FpDevice *dev, guint8 cmd, const guint8 *mode, gboolean reply,
++          guint timeout_ms, FpiSsm *ssm)
++{
++  guint8 payload[GOODIX_53XD_FDT_LEN + 1];
++
++  memcpy (payload, mode, GOODIX_53XD_FDT_LEN);
++  payload[GOODIX_53XD_FDT_LEN] = reply ? 0x01 : 0x00;
++
++  goodix_send_protocol (dev, cmd, payload, sizeof (payload), NULL, TRUE,
++                        timeout_ms, reply, goodixtls5xx_check_none_cmd, ssm);
++}
++
++static void
++request_image (FpDevice *dev, GoodixImageCallback callback, FpiSsm *ssm)
++{
++  const guint16 base = GOODIX53XD_DAC_BASE;
++  guint8 request[10];
++
++  request[0] = 0x01;
++  request[1] = 0x03;
++  // Per-quadrant DAC values, same offsets as driver_53xd.py
++  FP_WRITE_UINT16_LE (request + 2, base);
++  FP_WRITE_UINT16_LE (request + 4, base - 6);
++  FP_WRITE_UINT16_LE (request + 6, base);
++  FP_WRITE_UINT16_LE (request + 8, base - 4);
++
++  goodix_tls_read_image_request (dev, request, sizeof (request), callback, ssm);
++}
++
++static gboolean
++decode_frame (const guint8 *data, guint16 length, GoodixTls5xxPix *frame,
++              GError **error)
++{
++  if (!data || length < GOODIX53XD_RAW_FRAME_SIZE)
++    {
++      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                   "Invalid image frame (length: %d)", data ? length : 0);
++      return FALSE;
++    }
++
++  for (int i = 0; i != GOODIX53XD_RAW_FRAME_SIZE; i += 6)
++    {
++      const guint8 *chunk = data + i;
++      *frame++ = ((chunk[0] & 0xf) << 8) + chunk[1];
++      *frame++ = (chunk[3] << 4) + (chunk[0] >> 4);
++      *frame++ = ((chunk[5] & 0xf) << 8) + chunk[2];
++      *frame++ = (chunk[4] << 4) + (chunk[5] >> 4);
++    }
++  return TRUE;
++}
++
++static int
++touch_depth (const GoodixTls5xxPix *frame, const GoodixTls5xxPix *background,
++             int i)
++{
++  return MAX (0, (int) background[i] - (int) frame[i]);
++}
++
++static gdouble
++touched_share (const GoodixTls5xxPix *frame,
++               const GoodixTls5xxPix *background)
++{
++  int touched = 0;
++
++  for (int i = 0; i != GOODIX53XD_FRAME_SIZE; ++i)
++    if (touch_depth (frame, background, i) > GOODIX53XD_TOUCH_DELTA)
++      touched++;
++
++  return (gdouble) touched / GOODIX53XD_FRAME_SIZE;
++}
++
++// Debug aid: with FP_GOODIX53XD_DUMP=<dir>, save each raw frame followed by
++// the background (host-endian 16-bit pixels) for offline tuning
++static void
++dump_raw (const GoodixTls5xxPix *frame, const GoodixTls5xxPix *background,
++          const char *tag)
++{
++  static guint count = 0;
++  const gchar *dir = g_getenv ("FP_GOODIX53XD_DUMP");
++  g_autofree gchar *path = NULL;
++  FILE *file;
++
++  if (!dir)
++    return;
++
++  path = g_strdup_printf ("%s/raw-%04u-%s.bin", dir, count++, tag);
++  file = fopen (path, "wb");
++  if (!file)
++    return;
++  fwrite (frame, sizeof (GoodixTls5xxPix), GOODIX53XD_FRAME_SIZE, file);
++  fwrite (background, sizeof (GoodixTls5xxPix), GOODIX53XD_FRAME_SIZE, file);
++  fclose (file);
++}
++
++static int
++compare_int (const void *a, const void *b)
++{
++  return *(const int *) a - *(const int *) b;
++}
++
++// Background-subtract, normalize contrast locally (SIFT finds ~18 keypoints
++// per frame without it, below SIGFM's minimum of 25, and ~230 with it),
++// stretch the 1st-99th percentile to 8 bits with dark ridges, then upscale.
++// Must stay in sync with tools/sigfm-eval.cpp, which the threshold was
++// measured with.
++static FpImage *
++build_image (const GoodixTls5xxPix *frame, const GoodixTls5xxPix *background)
++{
++  const int r = GOODIX53XD_NORM_RADIUS;
++  int depth[GOODIX53XD_FRAME_SIZE];
++  int norm[GOODIX53XD_FRAME_SIZE];
++  int sorted[GOODIX53XD_FRAME_SIZE];
++  guint8 small[GOODIX53XD_FRAME_SIZE];
++  int lo, hi;
++  const int w = GOODIX53XD_WIDTH * GOODIX53XD_SCALE;
++  const int h = GOODIX53XD_HEIGHT * GOODIX53XD_SCALE;
++  FpImage *img;
++
++  for (int i = 0; i != GOODIX53XD_FRAME_SIZE; ++i)
++    depth[i] = touch_depth (frame, background, i);
++
++  for (int y = 0; y != GOODIX53XD_HEIGHT; ++y)
++    for (int x = 0; x != GOODIX53XD_WIDTH; ++x)
++      {
++        gdouble s = 0, s2 = 0, mean, sd;
++        int n = 0;
++
++        for (int yy = MAX (0, y - r); yy <= MIN (GOODIX53XD_HEIGHT - 1, y + r); ++yy)
++          for (int xx = MAX (0, x - r); xx <= MIN (GOODIX53XD_WIDTH - 1, x + r); ++xx)
++            {
++              gdouble v = depth[yy * GOODIX53XD_WIDTH + xx];
++              s += v;
++              s2 += v * v;
++              n++;
++            }
++        mean = s / n;
++        sd = sqrt (MAX (1.0, s2 / n - mean * mean));
++        norm[y * GOODIX53XD_WIDTH + x] =
++          (int) (1000 * (depth[y * GOODIX53XD_WIDTH + x] - mean) / sd);
++      }
++
++  memcpy (sorted, norm, sizeof (sorted));
++  qsort (sorted, GOODIX53XD_FRAME_SIZE, sizeof (int), compare_int);
++  lo = sorted[GOODIX53XD_FRAME_SIZE / 100];
++  hi = sorted[GOODIX53XD_FRAME_SIZE - 1 - GOODIX53XD_FRAME_SIZE / 100];
++  if (hi <= lo)
++    hi = lo + 1;
++
++  for (int i = 0; i != GOODIX53XD_FRAME_SIZE; ++i)
++    {
++      int d = CLAMP (norm[i], lo, hi);
++      small[i] = 255 - (d - lo) * 255 / (hi - lo);
++    }
++
++  img = fp_image_new (w, h);
++  img->flags |= FPI_IMAGE_PARTIAL;
++  for (int y = 0; y != h; ++y)
++    {
++      gdouble sy = CLAMP ((y + 0.5) / GOODIX53XD_SCALE - 0.5, 0,
++                          GOODIX53XD_HEIGHT - 1);
++      int y0 = (int) sy, y1 = MIN (y0 + 1, GOODIX53XD_HEIGHT - 1);
++      gdouble fy = sy - y0;
++
++      for (int x = 0; x != w; ++x)
++        {
++          gdouble sx = CLAMP ((x + 0.5) / GOODIX53XD_SCALE - 0.5, 0,
++                              GOODIX53XD_WIDTH - 1);
++          int x0 = (int) sx, x1 = MIN (x0 + 1, GOODIX53XD_WIDTH - 1);
++          gdouble fx = sx - x0;
++          gdouble top = small[y0 * GOODIX53XD_WIDTH + x0] * (1 - fx) +
++                        small[y0 * GOODIX53XD_WIDTH + x1] * fx;
++          gdouble bottom = small[y1 * GOODIX53XD_WIDTH + x0] * (1 - fx) +
++                           small[y1 * GOODIX53XD_WIDTH + x1] * fx;
++
++          img->data[y * w + x] = (guint8) (top * (1 - fy) + bottom * fy + 0.5);
++        }
++    }
++  return img;
++}
++
++// ---- HELPERS SECTION END ----
++
++// -----------------------------------------------------------------------------
++
++// ---- ACTIVE SECTION START ----
++
++enum activate_states {
++  ACTIVATE_READ_LOOP,
++  ACTIVATE_NOP,
++  ACTIVATE_CHECK_FW_VER,
++  ACTIVATE_CHECK_PSK,
++  ACTIVATE_RESET,
++  ACTIVATE_TLS,
++  ACTIVATE_UPLOAD_MCU_CONFIG,
++  ACTIVATE_FDT_MODE,
++  ACTIVATE_FDT_MODE_REPLY,
++  ACTIVATE_BACKGROUND_REG_ON,
++  ACTIVATE_BACKGROUND_IMAGE,
++  ACTIVATE_BACKGROUND_REG_OFF,
++  ACTIVATE_NUM_STATES,
++};
++
++static void
++check_psk (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
++           GError *error)
++{
++  guint32 flags, psk_length;
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (ssm, error);
++      return;
++    }
++
++  if (length < 9 || data[0] != 0x00)
++    {
++      fpi_ssm_mark_failed (ssm, g_error_new (FP_DEVICE_ERROR,
++                                             FP_DEVICE_ERROR_PROTO,
++                                             "Failed to read PSK from device"));
++      return;
++    }
++
++  flags = FP_READ_UINT32_LE (data + 1);
++  psk_length = FP_READ_UINT32_LE (data + 5);
++  fp_dbg ("Device PSK flags: 0x%08x", flags);
++
++  if (flags != GOODIX_53XD_PSK_FLAGS ||
++      psk_length != sizeof (goodix_53xd_pmk_hash) ||
++      length < 9 + psk_length ||
++      memcmp (data + 9, goodix_53xd_pmk_hash, psk_length))
++    {
++      fpi_ssm_mark_failed (ssm, g_error_new (FP_DEVICE_ERROR,
++                                             FP_DEVICE_ERROR_NOT_SUPPORTED,
++                                             "Sensor PSK is not the one flashed "
++                                             "by goodix-fp-dump"));
++      return;
++    }
++
++  fpi_ssm_next_state (ssm);
++}
++
++static void
++check_reset (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
++             GError *error)
++{
++  if (error)
++    {
++      fpi_ssm_mark_failed (ssm, error);
++      return;
++    }
++
++  if (length < 3 || data[0] != 0x01)
++    {
++      fpi_ssm_mark_failed (ssm, g_error_new (FP_DEVICE_ERROR,
++                                             FP_DEVICE_ERROR_PROTO,
++                                             "Failed to reset device"));
++      return;
++    }
++
++  fp_dbg ("Device reset number: %d", FP_READ_UINT16_LE (data + 1));
++  if (FP_READ_UINT16_LE (data + 1) != GOODIX_53XD_RESET_NUMBER)
++    {
++      fpi_ssm_mark_failed (ssm, g_error_new (FP_DEVICE_ERROR,
++                                             FP_DEVICE_ERROR_PROTO,
++                                             "Invalid device reset number: %d",
++                                             FP_READ_UINT16_LE (data + 1)));
++      return;
++    }
++
++  fpi_ssm_next_state (ssm);
++}
++
++static void
++on_tls_ready (FpDevice *dev, gpointer ssm, GError *error)
++{
++  if (error)
++    {
++      fpi_ssm_mark_failed (ssm, error);
++      return;
++    }
++
++  // goodix-fp-dump waits after the handshake, or the next command is lost
++  fpi_ssm_next_state_delayed (ssm, GOODIX53XD_TLS_SETTLE_MS);
++}
++
++static guint
++frame_median (const GoodixTls5xxPix *frame)
++{
++  guint hist[4096] = { 0 };
++  guint seen = 0;
++
++  for (int i = 0; i != GOODIX53XD_FRAME_SIZE; ++i)
++    hist[MIN (frame[i], 4095)]++;
++  for (guint v = 0; v != 4096; ++v)
++    {
++      seen += hist[v];
++      if (seen > GOODIX53XD_FRAME_SIZE / 2)
++        return v;
++    }
++  return 4095;
++}
++
++// If self->frame shows an empty sensor, make it the background. Returns
++// whether the sensor was empty.
++static gboolean
++update_background (FpiDeviceGoodixTls53xd *self)
++{
++  guint median = frame_median (self->frame);
++
++  if (median < GOODIX53XD_EMPTY_MEDIAN)
++    {
++      fp_dbg ("Finger on sensor (median %u), keeping %s background", median,
++              self->background_valid ? "previous" : "flat");
++      return FALSE;
++    }
++
++  memcpy (self->background, self->frame, sizeof (self->background));
++  self->background_valid = TRUE;
++  return TRUE;
++}
++
++static void
++on_background (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
++               GError *error)
++{
++  FpiDeviceGoodixTls53xd *self = FPI_DEVICE_GOODIXTLS53XD (dev);
++
++  if (!error)
++    decode_frame (data, length, self->frame, &error);
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (ssm, error);
++      return;
++    }
++
++  update_background (self);
++  fpi_ssm_next_state (ssm);
++}
++
++static void
++activate_run_state (FpiSsm *ssm, FpDevice *dev)
++{
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case ACTIVATE_READ_LOOP:
++      // Let replies left over from the previous session (the sensor keeps
++      // sending an image requested before deactivation) arrive, then drop
++      // them, like goodix-fp-dump's empty_buffer()
++      goodix_start_read_loop (dev);
++      fpi_ssm_next_state_delayed (ssm, GOODIX53XD_FLUSH_MS);
++      break;
++
++    case ACTIVATE_NOP:
++      goodix_flush_input (dev);
++      goodix_send_nop (dev, goodixtls5xx_check_none, ssm);
++      break;
++
++    case ACTIVATE_CHECK_FW_VER:
++      goodix_send_query_firmware_version (dev,
++                                          goodixtls5xx_check_firmware_version,
++                                          ssm);
++      break;
++
++    case ACTIVATE_CHECK_PSK:
++      {
++        guint8 payload[16];
++
++        // length, offset, flags, unused (53xd layout, not GoodixPresetPsk)
++        FP_WRITE_UINT32_LE (payload, sizeof (goodix_53xd_pmk_hash));
++        FP_WRITE_UINT32_LE (payload + 4, 0);
++        FP_WRITE_UINT32_LE (payload + 8, GOODIX_53XD_PSK_FLAGS);
++        FP_WRITE_UINT32_LE (payload + 12, 0);
++        goodix_send_protocol (dev, GOODIX_CMD_PRESET_PSK_READ, payload,
++                              sizeof (payload), NULL, TRUE, GOODIX_TIMEOUT,
++                              TRUE, check_psk, ssm);
++        break;
++      }
++
++    case ACTIVATE_RESET:
++      {
++        // Reset sensor (bits 0 and 2), no MCU soft reset, sleep 20 ms
++        const guint8 payload[] = { 0x05, 20 };
++
++        goodix_send_protocol (dev, GOODIX_CMD_RESET, payload, sizeof (payload),
++                              NULL, TRUE, GOODIX_TIMEOUT, TRUE, check_reset,
++                              ssm);
++        break;
++      }
++
++    case ACTIVATE_TLS:
++      goodix_tls_init (dev, on_tls_ready, ssm);
++      break;
++
++    case ACTIVATE_UPLOAD_MCU_CONFIG:
++      goodix_send_upload_config_mcu (dev, goodix_53xd_config,
++                                     sizeof (goodix_53xd_config), NULL,
++                                     goodixtls5xx_check_config_upload, ssm);
++      break;
++
++    case ACTIVATE_FDT_MODE:
++      send_fdt (dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_MODE, goodix_53xd_fdt_mode,
++                FALSE, GOODIX_TIMEOUT, ssm);
++      break;
++
++    case ACTIVATE_FDT_MODE_REPLY:
++      send_fdt (dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_MODE, goodix_53xd_fdt_mode,
++                TRUE, GOODIX_TIMEOUT, ssm);
++      break;
++
++    case ACTIVATE_BACKGROUND_REG_ON:
++      goodix_send_write_sensor_register (dev, GOODIX53XD_REG_IMAGE,
++                                         GOODIX53XD_REG_IMAGE_ON,
++                                         goodixtls5xx_check_none, ssm);
++      break;
++
++    case ACTIVATE_BACKGROUND_IMAGE:
++      request_image (dev, on_background, ssm);
++      break;
++
++    case ACTIVATE_BACKGROUND_REG_OFF:
++      goodix_send_write_sensor_register (dev, GOODIX53XD_REG_IMAGE,
++                                         GOODIX53XD_REG_IMAGE_OFF,
++                                         goodixtls5xx_check_none, ssm);
++      break;
++    }
++}
++
++static void
++activate_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
++{
++  if (error)
++    fp_err ("failed during activation: %s (code: %d)", error->message,
++            error->code);
++
++  fpi_image_device_activate_complete (FP_IMAGE_DEVICE (dev), error);
++}
++
++// ---- ACTIVE SECTION END ----
++
++// -----------------------------------------------------------------------------
++
++// ---- SCAN SECTION START ----
++
++enum scan_states {
++  SCAN_FDT_MODE,
++  SCAN_FDT_MODE_REPLY,
++  SCAN_SLEEP,
++  SCAN_QUERY_MCU,
++  SCAN_FDT_DOWN,
++  SCAN_WAIT_FINGER_DOWN,
++  SCAN_REG_ON,
++  SCAN_IMAGE,
++  SCAN_REG_OFF,
++  SCAN_SUBMIT,
++  SCAN_LIFT_REG_ON,
++  SCAN_LIFT_IMAGE,
++  SCAN_LIFT_REG_OFF,
++  SCAN_NUM_STATES,
++};
++
++static void
++on_finger_down (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
++                GError *error)
++{
++  FpiDeviceGoodixTls53xd *self = FPI_DEVICE_GOODIXTLS53XD (dev);
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (ssm, error);
++      return;
++    }
++
++  self->pressed = FALSE;
++  self->press_polls = 0;
++  self->last_coverage = 0;
++  self->stable_polls = 0;
++  self->best_coverage = -1;
++  fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), TRUE);
++  fpi_ssm_next_state (ssm);
++}
++
++static void
++on_press_image (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
++                GError *error)
++{
++  FpiDeviceGoodixTls53xd *self = FPI_DEVICE_GOODIXTLS53XD (dev);
++  gdouble coverage;
++
++  if (!error)
++    decode_frame (data, length, self->frame, &error);
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (ssm, error);
++      return;
++    }
++
++  coverage = touched_share (self->frame, self->background);
++  fp_dbg ("Finger covers %.0f%% of the sensor", coverage * 100);
++  dump_raw (self->frame, self->background, "press");
++
++  if (coverage > self->best_coverage)
++    {
++      self->best_coverage = coverage;
++      memcpy (self->best_frame, self->frame, sizeof (self->best_frame));
++    }
++
++  self->press_polls++;
++  if (coverage >= GOODIX53XD_PRESS_MIN_COVERAGE &&
++      ABS (coverage - self->last_coverage) < GOODIX53XD_PRESS_STABLE_DELTA)
++    self->stable_polls++;
++  else
++    self->stable_polls = 0;
++  self->pressed = self->stable_polls >= GOODIX53XD_PRESS_STABLE_POLLS ||
++                  self->press_polls >= GOODIX53XD_PRESS_MAX_POLLS;
++  self->last_coverage = coverage;
++  fpi_ssm_next_state (ssm);
++}
++
++static void
++on_press_reg_off (FpDevice *dev, gpointer ssm, GError *error)
++{
++  FpiDeviceGoodixTls53xd *self = FPI_DEVICE_GOODIXTLS53XD (dev);
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (ssm, error);
++      return;
++    }
++
++  if (self->pressed)
++    fpi_ssm_next_state (ssm);
++  else
++    {
++      self->scan_delayed = TRUE;
++      fpi_ssm_jump_to_state_delayed (ssm, SCAN_REG_ON,
++                                     GOODIX53XD_PRESS_POLL_MS);
++    }
++}
++
++static void
++on_lift_image (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
++               GError *error)
++{
++  FpiDeviceGoodixTls53xd *self = FPI_DEVICE_GOODIXTLS53XD (dev);
++
++  if (!error)
++    decode_frame (data, length, self->frame, &error);
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (ssm, error);
++      return;
++    }
++
++  dump_raw (self->frame, self->background, "lift");
++  // Judge by absolute level, so a bad background cannot keep us waiting
++  self->lifted = update_background (self);
++  fpi_ssm_next_state (ssm);
++}
++
++static void
++on_lift_reg_off (FpDevice *dev, gpointer ssm, GError *error)
++{
++  FpiDeviceGoodixTls53xd *self = FPI_DEVICE_GOODIXTLS53XD (dev);
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (ssm, error);
++      return;
++    }
++
++  // There is no known finger-up FDT payload for 53xd, so poll frames
++  if (self->lifted)
++    fpi_ssm_next_state (ssm);
++  else
++    {
++      self->scan_delayed = TRUE;
++      fpi_ssm_jump_to_state_delayed (ssm, SCAN_LIFT_REG_ON,
++                                     GOODIX53XD_LIFT_POLL_MS);
++    }
++}
++
++static void
++scan_run_state (FpiSsm *ssm, FpDevice *dev)
++{
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case SCAN_FDT_MODE:
++      send_fdt (dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_MODE, goodix_53xd_fdt_mode,
++                FALSE, GOODIX_TIMEOUT, ssm);
++      break;
++
++    case SCAN_FDT_MODE_REPLY:
++      send_fdt (dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_MODE, goodix_53xd_fdt_mode,
++                TRUE, GOODIX_TIMEOUT, ssm);
++      break;
++
++    case SCAN_SLEEP:
++      {
++        const guint8 payload[] = { 0x01, 0x00 };
++
++        goodix_send_protocol (dev, GOODIX53XD_CMD_MCU_SWITCH_TO_SLEEP_MODE,
++                              payload, sizeof (payload), NULL, TRUE,
++                              GOODIX_TIMEOUT, FALSE,
++                              goodixtls5xx_check_none_cmd, ssm);
++        break;
++      }
++
++    case SCAN_QUERY_MCU:
++      {
++        const guint8 payload[] = { 0x01, 0x01, 0x01 };
++
++        goodix_send_protocol (dev, GOODIX_CMD_QUERY_MCU_STATE, payload,
++                              sizeof (payload), NULL, TRUE, GOODIX_TIMEOUT,
++                              FALSE, goodixtls5xx_check_none_cmd, ssm);
++        break;
++      }
++
++    case SCAN_FDT_DOWN:
++      send_fdt (dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_DOWN, goodix_53xd_fdt_down,
++                FALSE, GOODIX_TIMEOUT, ssm);
++      break;
++
++    case SCAN_WAIT_FINGER_DOWN:
++      {
++        guint8 payload[GOODIX_53XD_FDT_LEN + 1];
++
++        // The reply only comes once a finger is on the sensor: no timeout
++        memcpy (payload, goodix_53xd_fdt_down, GOODIX_53XD_FDT_LEN);
++        payload[GOODIX_53XD_FDT_LEN] = 0x01;
++        goodix_send_protocol (dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_DOWN, payload,
++                              sizeof (payload), NULL, TRUE, 0, TRUE,
++                              on_finger_down, ssm);
++        break;
++      }
++
++    case SCAN_REG_ON:
++    case SCAN_LIFT_REG_ON:
++      FPI_DEVICE_GOODIXTLS53XD (dev)->scan_delayed = FALSE;
++      goodix_send_write_sensor_register (dev, GOODIX53XD_REG_IMAGE,
++                                         GOODIX53XD_REG_IMAGE_ON,
++                                         goodixtls5xx_check_none, ssm);
++      break;
++
++    case SCAN_IMAGE:
++      request_image (dev, on_press_image, ssm);
++      break;
++
++    case SCAN_REG_OFF:
++      goodix_send_write_sensor_register (dev, GOODIX53XD_REG_IMAGE,
++                                         GOODIX53XD_REG_IMAGE_OFF,
++                                         on_press_reg_off, ssm);
++      break;
++
++    case SCAN_SUBMIT:
++      {
++        FpiDeviceGoodixTls53xd *self = FPI_DEVICE_GOODIXTLS53XD (dev);
++        FpImage *img = build_image (self->best_frame, self->background);
++        const gchar *dump = g_getenv ("FP_GOODIX53XD_DUMP");
++
++        fp_dbg ("Submitting frame with %.0f%% coverage after %d polls",
++                self->best_coverage * 100, self->press_polls);
++        // Debug aid: save every frame handed to libfprint, before NBIS
++        if (dump)
++          {
++            static guint dump_count = 0;
++            g_autofree gchar *path = g_strdup_printf ("%s/goodix53xd-%03u.pgm",
++                                                      dump, dump_count++);
++            goodixtls5xx_save_image_to_pgm (img, path);
++          }
++
++        fpi_image_device_image_captured (FP_IMAGE_DEVICE (dev), img);
++        fpi_ssm_next_state (ssm);
++        break;
++      }
++
++    case SCAN_LIFT_IMAGE:
++      request_image (dev, on_lift_image, ssm);
++      break;
++
++    case SCAN_LIFT_REG_OFF:
++      goodix_send_write_sensor_register (dev, GOODIX53XD_REG_IMAGE,
++                                         GOODIX53XD_REG_IMAGE_OFF,
++                                         on_lift_reg_off, ssm);
++      break;
++    }
++}
++
++static void
++scan_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
++{
++  FpiDeviceGoodixTls53xd *self = FPI_DEVICE_GOODIXTLS53XD (dev);
++
++  self->scan_ssm = NULL;
++
++  if (error)
++    {
++      fp_err ("failed to scan: %s (code: %d)", error->message, error->code);
++      fpi_image_device_session_error (FP_IMAGE_DEVICE (dev), error);
++      return;
++    }
++
++  fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), FALSE);
++}
++
++// ---- SCAN SECTION END ----
++
++// -----------------------------------------------------------------------------
++
++// ---- DEV SECTION START ----
++
++static void
++dev_activate (FpImageDevice *img_dev)
++{
++  FpDevice *dev = FP_DEVICE (img_dev);
++
++  fpi_ssm_start (fpi_ssm_new (dev, activate_run_state, ACTIVATE_NUM_STATES),
++                 activate_complete);
++}
++
++static void
++dev_change_state (FpImageDevice *img_dev, FpiImageDeviceState state)
++{
++  FpiDeviceGoodixTls53xd *self = FPI_DEVICE_GOODIXTLS53XD (img_dev);
++
++  if (state != FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON)
++    return;
++
++  if (self->scan_ssm)
++    {
++      fp_warn ("Scan already running");
++      return;
++    }
++
++  self->scan_ssm = fpi_ssm_new (FP_DEVICE (img_dev), scan_run_state,
++                                SCAN_NUM_STATES);
++  fpi_ssm_start (self->scan_ssm, scan_complete);
++}
++
++static void
++dev_deactivate (FpImageDevice *img_dev)
++{
++  FpiDeviceGoodixTls53xd *self = FPI_DEVICE_GOODIXTLS53XD (img_dev);
++  FpDevice *dev = FP_DEVICE (img_dev);
++  GError *error = NULL;
++
++  // A scan may be waiting for a finger; drop it with its pending command.
++  if (self->scan_ssm && self->scan_delayed)
++    fpi_ssm_cancel_delayed_state_change (self->scan_ssm);
++  self->scan_delayed = FALSE;
++  g_clear_pointer (&self->scan_ssm, fpi_ssm_free);
++  goodix_reset_state (dev);
++  goodix_shutdown_tls (dev, &error);
++
++  fpi_image_device_deactivate_complete (img_dev, error);
++}
++
++// ---- DEV SECTION END ----
++
++static void
++fpi_device_goodixtls53xd_init (FpiDeviceGoodixTls53xd *self)
++{
++  for (int i = 0; i != GOODIX53XD_FRAME_SIZE; ++i)
++    self->background[i] = GOODIX53XD_EMPTY_LEVEL;
++}
++
++static void
++fpi_device_goodixtls53xd_class_init (FpiDeviceGoodixTls53xdClass *class)
++{
++  FpiDeviceGoodixTlsClass *gx_class = FPI_DEVICE_GOODIXTLS_CLASS (class);
++  FpDeviceClass *dev_class = FP_DEVICE_CLASS (class);
++  FpImageDeviceClass *img_dev_class = FP_IMAGE_DEVICE_CLASS (class);
++  FpiDeviceGoodixTls5xxClass *xx_cls = FPI_DEVICE_GOODIXTLS5XX_CLASS (class);
++
++  xx_cls->firmware_version = GOODIX_53XD_FIRMWARE_VERSION;
++
++  gx_class->interface = GOODIX_53XD_INTERFACE;
++  gx_class->ep_in = GOODIX_53XD_EP_IN;
++  gx_class->ep_out = GOODIX_53XD_EP_OUT;
++  gx_class->skip_tls_established = TRUE;
++
++  dev_class->id = "goodixtls53xd";
++  dev_class->full_name = "Goodix TLS Fingerprint Sensor 53xd";
++  dev_class->type = FP_DEVICE_TYPE_USB;
++  dev_class->id_table = id_table;
++  dev_class->nr_enroll_stages = 15;
++
++  dev_class->scan_type = FP_SCAN_TYPE_PRESS;
++
++  // NBIS cannot work here: images carry at most ~8 minutiae, bozorth3 needs
++  // 10. SIGFM scores geometrically consistent SIFT matches instead.
++  // Measured with tools/sigfm-eval (15 min between enroll and probe): 24
++  // touches of 3 other fingers scored at most 3, and 4 of 8 genuine touches
++  // reached 10 or more. 10 keeps a 3x margin over the impostors seen.
++  img_dev_class->algorithm = FPI_DEVICE_ALGO_SIGFM;
++  img_dev_class->bz3_threshold = 10;
++  img_dev_class->img_width = GOODIX53XD_WIDTH * GOODIX53XD_SCALE;
++  img_dev_class->img_height = GOODIX53XD_HEIGHT * GOODIX53XD_SCALE;
++
++  img_dev_class->activate = dev_activate;
++  img_dev_class->deactivate = dev_deactivate;
++  img_dev_class->change_state = dev_change_state;
++
++  fpi_device_class_auto_initialize_features (dev_class);
++}
+diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/drivers/goodixtls/goodix53xd.h libfprint/libfprint/drivers/goodixtls/goodix53xd.h
+--- a/libfprint/drivers/goodixtls/goodix53xd.h
++++ b/libfprint/drivers/goodixtls/goodix53xd.h
+@@ -0,0 +1,80 @@
++// Goodix Tls driver for libfprint
++
++// This library is free software; you can redistribute it and/or
++// modify it under the terms of the GNU Lesser General Public
++// License as published by the Free Software Foundation; either
++// version 2.1 of the License, or (at your option) any later version.
++
++// This library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++// Lesser General Public License for more details.
++
++// You should have received a copy of the GNU Lesser General Public
++// License along with this library; if not, write to the Free Software
++// Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++
++#pragma once
++
++#define GOODIX_53XD_INTERFACE (0)
++#define GOODIX_53XD_EP_IN (0x3 | FPI_USB_ENDPOINT_IN)
++#define GOODIX_53XD_EP_OUT (0x1 | FPI_USB_ENDPOINT_OUT)
++
++#define GOODIX_53XD_FIRMWARE_VERSION ("GF5298_GM168SEC_APP_13016")
++
++#define GOODIX_53XD_PSK_FLAGS (0xbb020001)
++
++#define GOODIX_53XD_RESET_NUMBER (2048)
++
++// SHA256 of the PMK derived from the all-zero PSK. The sensor only reports
++// this after being reflashed with goodix-fp-dump (driver_53xd.py); the
++// factory PSK is unknown, so a stock sensor cannot be used by this driver.
++const guint8 goodix_53xd_pmk_hash[] = {
++  0x66, 0x68, 0x7a, 0xad, 0xf8, 0x62, 0xbd, 0x77, 0x6c, 0x8f, 0xc1, 0x8b,
++  0x8e, 0x9f, 0x8e, 0x20, 0x08, 0x97, 0x14, 0x85, 0x6e, 0xe2, 0x33, 0xb3,
++  0x90, 0x2a, 0x59, 0x1d, 0x0d, 0x5f, 0x29, 0x25};
++
++// MCU config from goodix-fp-dump driver_53xd.py
++guint8 goodix_53xd_config[] = {
++  0x70, 0x11, 0x60, 0x71, 0x2c, 0x9d, 0x2c, 0xc9, 0x1c, 0xe5, 0x18, 0xfd,
++  0x00, 0xfd, 0x00, 0xfd, 0x03, 0xba, 0x00, 0x01, 0x80, 0xca, 0x00, 0x08,
++  0x00, 0x84, 0x00, 0xbe, 0xc3, 0x86, 0x00, 0xb1, 0xb6, 0x88, 0x00, 0xba,
++  0xba, 0x8a, 0x00, 0xb3, 0xb3, 0x8c, 0x00, 0xbc, 0xbc, 0x8e, 0x00, 0xb1,
++  0xb1, 0x90, 0x00, 0xbb, 0xbb, 0x92, 0x00, 0xb1, 0xb1, 0x94, 0x00, 0x00,
++  0x00, 0x96, 0x00, 0x00, 0x00, 0x98, 0x00, 0x00, 0x00, 0x9a, 0x00, 0x00,
++  0x00, 0xd2, 0x00, 0x00, 0x00, 0xd4, 0x00, 0x00, 0x00, 0xd6, 0x00, 0x00,
++  0x00, 0xd8, 0x00, 0x00, 0x00, 0x50, 0x00, 0x01, 0x05, 0xd0, 0x00, 0x00,
++  0x00, 0x70, 0x00, 0x00, 0x00, 0x72, 0x00, 0x78, 0x56, 0x74, 0x00, 0x34,
++  0x12, 0x20, 0x00, 0x10, 0x40, 0x2a, 0x01, 0x02, 0x04, 0x22, 0x00, 0x01,
++  0x20, 0x24, 0x00, 0x32, 0x00, 0x80, 0x00, 0x01, 0x00, 0x5c, 0x00, 0x01,
++  0x01, 0x56, 0x00, 0x24, 0x20, 0x58, 0x00, 0x01, 0x02, 0x32, 0x00, 0x04,
++  0x02, 0x66, 0x00, 0x00, 0x02, 0x7c, 0x00, 0x00, 0x58, 0x82, 0x00, 0x7f,
++  0x08, 0x2a, 0x01, 0x82, 0x07, 0x22, 0x00, 0x01, 0x20, 0x24, 0x00, 0x14,
++  0x00, 0x80, 0x00, 0x01, 0x40, 0x5c, 0x00, 0xe7, 0x00, 0x56, 0x00, 0x06,
++  0x14, 0x58, 0x00, 0x04, 0x02, 0x32, 0x00, 0x0c, 0x02, 0x66, 0x00, 0x00,
++  0x02, 0x7c, 0x00, 0x00, 0x58, 0x82, 0x00, 0x80, 0x08, 0x2a, 0x01, 0x08,
++  0x00, 0x5c, 0x00, 0x01, 0x01, 0x54, 0x00, 0x00, 0x01, 0x62, 0x00, 0x08,
++  0x04, 0x64, 0x00, 0x10, 0x00, 0x66, 0x00, 0x00, 0x02, 0x7c, 0x00, 0x00,
++  0x58, 0x2a, 0x01, 0x08, 0x00, 0x5c, 0x00, 0xdc, 0x00, 0x52, 0x00, 0x08,
++  0x00, 0x54, 0x00, 0x00, 0x01, 0x66, 0x00, 0x00, 0x02, 0x7c, 0x00, 0x00,
++  0x58, 0x20, 0xc5, 0x1d};
++
++// FDT payloads from driver_53xd.py, without the trailing "wait for reply"
++// byte. The four 16-bit words after the first two bytes are DAC values; the
++// last eight pairs in fdt_down are per-region finger-down thresholds.
++#define GOODIX_53XD_FDT_LEN (26)
++
++static const guint8 goodix_53xd_fdt_mode[GOODIX_53XD_FDT_LEN] = {
++  0x0d, 0x01, 0x28, 0x01, 0x22, 0x01, 0x28, 0x01, 0x24, 0x01, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00};
++
++static const guint8 goodix_53xd_fdt_down[GOODIX_53XD_FDT_LEN] = {
++  0x8c, 0x01, 0x28, 0x01, 0x22, 0x01, 0x28, 0x01, 0x24, 0x01, 0x91, 0x91,
++  0x8b, 0x8b, 0x96, 0x96, 0x91, 0x91, 0x98, 0x98, 0x90, 0x90, 0x92, 0x92,
++  0x88, 0x88};
++
++static const FpIdEntry id_table[] = {
++  {.vid = 0x27c6, .pid = 0x532d},
++  {.vid = 0, .pid = 0, .driver_data = 0},
++};
+diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/drivers/goodixtls/goodix.c libfprint/libfprint/drivers/goodixtls/goodix.c
+--- a/libfprint/drivers/goodixtls/goodix.c
++++ b/libfprint/drivers/goodixtls/goodix.c
+@@ -382,6 +382,25 @@
+   memcpy (priv->data + priv->length, data, length);
+   priv->length += length;
+ 
++  // A reply left over from a previous session (e.g. an image requested just
++  // before deactivation) can arrive mid-packet. Without this check its bytes
++  // are taken for a header and every later reply is swallowed as "not full".
++  if (priv->length >= sizeof (GoodixPack) + sizeof (guint8))
++    {
++      guint8 head = priv->data[0];
++
++      if ((head != GOODIX_FLAGS_MSG_PROTOCOL && head != GOODIX_FLAGS_TLS &&
++           head != GOODIX_FLAGS_TLS_DATA) ||
++          goodix_calc_checksum (priv->data, sizeof (GoodixPack)) !=
++          priv->data[sizeof (GoodixPack)])
++        {
++          fp_dbg ("Dropping %u bytes of out-of-sync data", priv->length);
++          g_clear_pointer (&priv->data, g_free);
++          priv->length = 0;
++          return;
++        }
++    }
++
+   if (!goodix_decode_pack (priv->data, priv->length, &flags, &payload,
+                            &payload_len, &valid_checksum))
+     {
+@@ -405,6 +424,17 @@
+       // TODO
+       break;
+ 
++    case GOODIX_FLAGS_TLS_DATA:
++      fp_dbg ("Got TLS data msg");
++      if (payload_len <= GOODIX_TLS_DATA_HEADER_LEN)
++        {
++          fp_warn ("TLS data msg too short: %d", payload_len);
++          break;
++        }
++      goodix_receive_done (dev, payload + GOODIX_TLS_DATA_HEADER_LEN,
++                           payload_len - GOODIX_TLS_DATA_HEADER_LEN, NULL);
++      break;
++
+     default:
+       fp_warn ("Unknown flags: 0x%02x", flags);
+       break;
+@@ -457,6 +487,19 @@
+ }
+ 
+ void
++goodix_flush_input (FpDevice *dev)
++{
++  FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS (dev);
++  FpiDeviceGoodixTlsPrivate *priv =
++    fpi_device_goodixtls_get_instance_private (self);
++
++  if (priv->length)
++    fp_dbg ("Discarding %u bytes of stale input", priv->length);
++  g_clear_pointer (&priv->data, g_free);
++  priv->length = 0;
++}
++
++void
+ goodix_start_read_loop (FpDevice *dev)
+ {
+   FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS (dev);
+@@ -1294,6 +1337,11 @@
+   if (error)
+     fp_dbg ("failed to do tls handshake: %s (code: %d)", error->message,
+             error->code);
++  if (FPI_DEVICE_GOODIXTLS_GET_CLASS (dev)->skip_tls_established)
++    {
++      on_tls_successfully_established (dev, NULL, NULL);
++      return;
++    }
+   goodix_send_tls_successfully_established (
+     dev, on_tls_successfully_established, NULL);
+ }
+@@ -1489,6 +1537,25 @@
+   goodix_send_mcu_get_image (dev, goodix_tls_ready_image_handler, cb_info);
+ }
+ 
++void
++goodix_tls_read_image_request (FpDevice *dev, const guint8 *request,
++                               guint16 length, GoodixImageCallback callback,
++                               gpointer user_data)
++{
++  g_assert (callback);
++  GoodixCallbackInfo *cb_info = malloc (sizeof (GoodixCallbackInfo));
++  GoodixCallbackInfo *recv_info = malloc (sizeof (GoodixCallbackInfo));
++
++  cb_info->callback = G_CALLBACK (callback);
++  cb_info->user_data = user_data;
++  recv_info->callback = G_CALLBACK (goodix_tls_ready_image_handler);
++  recv_info->user_data = cb_info;
++
++  goodix_send_protocol (dev, GOODIX_CMD_MCU_GET_IMAGE, request, length, NULL,
++                        TRUE, GOODIX_TIMEOUT, TRUE, goodix_receive_default,
++                        recv_info);
++}
++
+ // ---- TLS SECTION END ----
+ 
+ static void
+diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/drivers/goodixtls/goodix.h libfprint/libfprint/drivers/goodixtls/goodix.h
+--- a/libfprint/drivers/goodixtls/goodix.h
++++ b/libfprint/drivers/goodixtls/goodix.h
+@@ -37,6 +37,10 @@
+   gint               interface;
+   guint8             ep_in;
+   guint8             ep_out;
++
++  /* 53xd: TLS_SUCCESSFULLY_ESTABLISHED is not part of the handshake and
++   * makes the sensor drop the next command. */
++  gboolean           skip_tls_established;
+ };
+ 
+ typedef struct __attribute__((__packed__)) _GoodixCallbackInfo
+@@ -183,6 +187,14 @@
+  * @param dev
+  */
+ void goodix_start_read_loop (FpDevice *dev);
++
++/**
++ * @brief Drop partially received data, e.g. replies left over from a
++ * previous session that arrived before the first command of this one
++ *
++ * @param dev
++ */
++void goodix_flush_input (FpDevice *dev);
+ // ---- GOODIX RECEIVE SECTION END ----
+ 
+ // -----------------------------------------------------------------------------
+@@ -567,4 +579,20 @@
+                             GoodixImageCallback callback,
+                             gpointer            user_data);
+ 
++/**
++ * @brief Like goodix_tls_read_image(), with a device specific MCU_GET_IMAGE
++ * request payload (e.g. per-frame DAC values on 53xd sensors)
++ *
++ * @param dev
++ * @param request request payload
++ * @param length length of the request payload
++ * @param callback Called when the image is decrypted
++ * @param user_data
++ */
++void goodix_tls_read_image_request (FpDevice           *dev,
++                                    const guint8       *request,
++                                    guint16             length,
++                                    GoodixImageCallback callback,
++                                    gpointer            user_data);
++
+ // ---- TLS SECTION END ----
+diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/drivers/goodixtls/goodix_proto.h libfprint/libfprint/drivers/goodixtls/goodix_proto.h
+--- a/libfprint/drivers/goodixtls/goodix_proto.h
++++ b/libfprint/drivers/goodixtls/goodix_proto.h
+@@ -27,6 +27,10 @@
+ 
+ #define GOODIX_FLAGS_MSG_PROTOCOL (0xa0)
+ #define GOODIX_FLAGS_TLS (0xb0)
++// TLS application data carrying a command reply (e.g. MCU_GET_IMAGE on 53xd),
++// prefixed by GOODIX_TLS_DATA_HEADER_LEN bytes before the TLS record.
++#define GOODIX_FLAGS_TLS_DATA (0xb2)
++#define GOODIX_TLS_DATA_HEADER_LEN (9)
+ 
+ #define GOODIX_CMD_NOP (0x00)
+ #define GOODIX_CMD_MCU_GET_IMAGE (0x20)
+diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/fpi-device.c libfprint/libfprint/fpi-device.c
+--- a/libfprint/fpi-device.c
++++ b/libfprint/fpi-device.c
+@@ -381,8 +381,10 @@
+ 
+   g_source_attach (&source->source, context);
+   g_source_set_callback (&source->source, (GSourceFunc) func, user_data, destroy_notify);
++  /* Not g_source_get_time(): that is cached per main loop iteration and is
++   * stale if the loop was blocked (e.g. on stdin), firing the timeout early. */
+   g_source_set_ready_time (&source->source,
+-                           g_source_get_time (&source->source) + interval * (guint64) 1000);
++                           g_get_monotonic_time () + interval * (guint64) 1000);
+   priv->sources = g_slist_prepend (priv->sources, source);
+   g_source_unref (&source->source);
+ 
+diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/fpi-image-device.c libfprint/libfprint/fpi-image-device.c
+--- a/libfprint/fpi-image-device.c
++++ b/libfprint/fpi-image-device.c
+@@ -17,6 +17,7 @@
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
+ 
++#include "fpi-print.h"
+ #define FP_COMPONENT "image_device"
+ #include "fpi-log.h"
+ 
+@@ -276,7 +277,7 @@
+   if (!error)
+     {
+       print = fp_print_new (device);
+-      fpi_print_set_type (print, FPI_PRINT_NBIS);
++      fpi_print_set_type (print, priv->algorithm);
+       if (!fpi_print_add_from_image (print, image, &error))
+         {
+           g_clear_object (&print);
+@@ -319,13 +320,22 @@
+   else if (action == FPI_DEVICE_ACTION_VERIFY)
+     {
+       FpPrint *template;
+-      FpiMatchResult result;
++      FpiMatchResult result = FPI_MATCH_ERROR;
+ 
+       fpi_device_get_verify_data (device, &template);
+       if (print)
+-        result = fpi_print_bz3_match (template, print, priv->bz3_threshold, &error);
++        {
++          if (priv->algorithm == FPI_PRINT_NBIS)
++            result = fpi_print_bz3_match (template, print, priv->bz3_threshold,
++                                          &error);
++          else if (priv->algorithm == FPI_PRINT_SIGFM)
++            result = fpi_print_sigfm_match (template, print, priv->bz3_threshold,
++                                          &error);
++        }
+       else
+-        result = FPI_MATCH_ERROR;
++        {
++          result = FPI_MATCH_ERROR;
++        }
+ 
+       if (!error || error->domain == FP_DEVICE_RETRY)
+         fpi_device_verify_report (device, result, g_steal_pointer (&print), g_steal_pointer (&error));
+@@ -343,7 +353,15 @@
+         {
+           FpPrint *template = g_ptr_array_index (templates, i);
+ 
+-          if (fpi_print_bz3_match (template, print, priv->bz3_threshold, &error) == FPI_MATCH_SUCCESS)
++          int match_result = FPI_MATCH_ERROR;
++          if (priv->algorithm == FPI_PRINT_NBIS)
++            match_result = fpi_print_bz3_match (template, print,
++                                                priv->bz3_threshold, &error);
++          else if (priv->algorithm == FPI_PRINT_SIGFM)
++            match_result = fpi_print_sigfm_match (template, print,
++                                                priv->bz3_threshold, &error);
++
++          if (match_result == FPI_MATCH_SUCCESS)
+             {
+               result = template;
+               break;
+@@ -494,12 +512,20 @@
+ 
+   priv->minutiae_scan_active = TRUE;
+ 
+-  /* XXX: We also detect minutiae in capture mode, we solely do this
+-   *      to normalize the image which will happen as a by-product. */
+-  fp_image_detect_minutiae (image,
+-                            fpi_device_get_cancellable (FP_DEVICE (self)),
+-                            fpi_image_device_minutiae_detected,
+-                            self);
++  if (priv->algorithm != FPI_PRINT_SIGFM)
++    {
++      /* XXX: We also detect minutiae in capture mode, we solely do this
++       *      to normalize the image which will happen as a by-product. */
++      fp_image_detect_minutiae (image,
++                                fpi_device_get_cancellable (FP_DEVICE (self)),
++                                fpi_image_device_minutiae_detected, self);
++    }
++  else
++    {
++      fp_image_extract_sigfm_info (image,
++                                 fpi_device_get_cancellable (FP_DEVICE (self)),
++                                 fpi_image_device_minutiae_detected, self);
++    }
+ 
+   /* XXX: This is wrong if we add support for raw capture mode. */
+   fp_image_device_change_state (self, FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_OFF);
+diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/fpi-image-device.h libfprint/libfprint/fpi-image-device.h
+--- a/libfprint/fpi-image-device.h
++++ b/libfprint/fpi-image-device.h
+@@ -19,8 +19,9 @@
+ 
+ #pragma once
+ 
+-#include "fpi-device.h"
+ #include "fp-image-device.h"
++#include "fpi-device.h"
++#include "fpi-print.h"
+ 
+ /**
+  * FpiImageDeviceState:
+@@ -70,6 +71,11 @@
+   FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_OFF,
+ } FpiImageDeviceState;
+ 
++typedef enum {
++  FPI_DEVICE_ALGO_NBIS = FPI_PRINT_NBIS,
++  FPI_DEVICE_ALGO_SIGFM = FPI_PRINT_SIGFM,
++} FpiImageDeviceAlgorithm;
++
+ /**
+  * FpImageDeviceClass:
+  * @bz3_threshold: Threshold to consider bozorth3 score a match, default: 40
+@@ -102,18 +108,19 @@
+  */
+ struct _FpImageDeviceClass
+ {
+-  FpDeviceClass parent_class;
++  FpDeviceClass           parent_class;
+ 
+-  gint          bz3_threshold;
+-  gint          img_width;
+-  gint          img_height;
+-
+-  void          (*img_open)     (FpImageDevice *dev);
+-  void          (*img_close)    (FpImageDevice *dev);
+-  void          (*activate)     (FpImageDevice *dev);
+-  void          (*change_state) (FpImageDevice      *dev,
+-                                 FpiImageDeviceState state);
+-  void          (*deactivate)   (FpImageDevice *dev);
++  gint                    bz3_threshold;
++  gint                    img_width;
++  gint                    img_height;
++  FpiImageDeviceAlgorithm algorithm;
++
++  void                    (*img_open)     (FpImageDevice *dev);
++  void                    (*img_close)    (FpImageDevice *dev);
++  void                    (*activate)     (FpImageDevice *dev);
++  void                    (*change_state) (FpImageDevice      *dev,
++                                           FpiImageDeviceState state);
++  void                    (*deactivate)   (FpImageDevice *dev);
+ };
+ 
+ void fpi_image_device_set_bz3_threshold (FpImageDevice *self,
+diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/fpi-image.h libfprint/libfprint/fpi-image.h
+--- a/libfprint/fpi-image.h
++++ b/libfprint/fpi-image.h
+@@ -21,6 +21,8 @@
+ #pragma once
+ 
+ #include "fp-image.h"
++#include "sigfm/sigfm.hpp"
++#include <config.h>
+ 
+ /**
+  * FpiImageFlags:
+@@ -63,11 +65,12 @@
+   FpiImageFlags flags;
+ 
+   /*< private >*/
+-  guint8    *data;
+-  guint8    *binarized;
++  guint8      *data;
++  guint8      *binarized;
+ 
+-  GPtrArray *minutiae;
+-  guint      ref_count;
++  GPtrArray   *minutiae;
++  SigfmImgInfo * sigfm_info;
++  guint        ref_count;
+ };
+ 
+ gint fpi_std_sq_dev (const guint8 *buf,
+diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/fp-image.c libfprint/libfprint/fp-image.c
+--- a/libfprint/fp-image.c
++++ b/libfprint/fp-image.c
+@@ -18,6 +18,7 @@
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
+ 
++#include "sigfm/sigfm.hpp"
+ #define FP_COMPONENT "image"
+ 
+ #include "fpi-compat.h"
+@@ -160,15 +161,25 @@
+ 
+ typedef struct
+ {
+-  GAsyncReadyCallback user_cb;
+-  struct fp_minutiae *minutiae;
+-  gint                width, height;
+-  gdouble             ppmm;
+-  FpiImageFlags       flags;
+-  guchar             *image;
+-  guchar             *binarized;
++  GAsyncReadyCallback  user_cb;
++  struct fp_minutiae * minutiae;
++
++  gint                 width, height;
++  gdouble              ppmm;
++  FpiImageFlags        flags;
++  guchar              *image;
++  guchar              *binarized;
+ } DetectMinutiaeData;
+ 
++typedef struct
++{
++  SigfmImgInfo        * sigfm_info;
++  guchar            * image;
++  gint                width;
++  gint                height;
++  GAsyncReadyCallback user_cb;
++} ExtractSigfmData;
++
+ static void
+ fp_image_detect_minutiae_free (DetectMinutiaeData *data)
+ {
+@@ -179,6 +190,35 @@
+ }
+ 
+ static void
++fp_image_sigfm_extract_free (ExtractSigfmData * data)
++{
++  g_clear_pointer (&data->image, g_free);
++  g_clear_pointer (&data->sigfm_info, sigfm_free_info);
++  g_free (data);
++}
++
++static void
++fp_image_sigfm_extract_cb (GObject * source_object, GAsyncResult * res,
++                         gpointer user_data)
++{
++  GTask * task = G_TASK (res);
++  FpImage * image;
++  ExtractSigfmData * data = g_task_get_task_data (task);
++
++  if (!g_task_had_error (task))
++    {
++      image = FP_IMAGE (source_object);
++
++      g_clear_pointer (&image->data, g_free);
++      image->data = g_steal_pointer (&data->image);
++      image->sigfm_info = g_steal_pointer (&data->sigfm_info);
++    }
++
++  if (data->user_cb)
++    data->user_cb (source_object, res, user_data);
++}
++
++static void
+ fp_image_detect_minutiae_cb (GObject      *source_object,
+                              GAsyncResult *res,
+                              gpointer      user_data)
+@@ -203,7 +243,6 @@
+       g_clear_pointer (&image->minutiae, g_ptr_array_unref);
+       image->minutiae = g_ptr_array_new_full (data->minutiae->num,
+                                               (GDestroyNotify) free_minutia);
+-
+       for (i = 0; i < data->minutiae->num; i++)
+         g_ptr_array_add (image->minutiae,
+                          g_steal_pointer (&data->minutiae->list[i]));
+@@ -266,6 +305,29 @@
+ }
+ 
+ static void
++fp_image_sigfm_extract_thread_func (GTask * task, void * src_obj,
++                                  void * task_data,
++                                  GCancellable * cancellable)
++{
++  ExtractSigfmData * data = task_data;
++  GTimer * timer = g_timer_new ();
++
++  data->sigfm_info = sigfm_extract (data->image, data->width, data->height);
++  g_timer_stop (timer);
++  fp_dbg ("sigfm extract completed in %f secs", g_timer_elapsed (timer, NULL));
++  g_timer_destroy (timer);
++  if (sigfm_keypoints_count (data->sigfm_info) < 25)
++    {
++      g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_FAILED,
++                               "No enough keypoints found");
++      g_object_unref (task);
++      return;
++    }
++  g_task_return_boolean (task, TRUE);
++  g_object_unref (task);
++}
++
++static void
+ fp_image_detect_minutiae_thread_func (GTask        *task,
+                                       gpointer      source_object,
+                                       gpointer      task_data,
+@@ -431,6 +493,51 @@
+ }
+ 
+ /**
++ * fp_image_get_sigfm_info:
++ * @self: A #FpImage
++ *
++ * Gets the SIGFM keypoints and descriptors for an image. This data must
++ * not be modified or freed. You need to first extract keypoints and
++ * descriptors using fp_image_extract_sigfm_info().
++ *
++ * Returns: (transfer none) (element-type SigfmImgInfo): The detected minutiae
++ */
++SigfmImgInfo *
++fp_image_get_sigfm_info (FpImage * self)
++{
++  return self->sigfm_info;
++}
++
++/**
++ * fp_image_extract_sigfm_info:
++ * @self: A #FpImage
++ * @cancellable: a #GCancellable, or %NULL
++ * @callback: the function to call on completion
++ * @user_data: the data to pass to @callback
++ *
++ * Extracts keypoints and descriptors found in an image.
++ */
++void
++fp_image_extract_sigfm_info (FpImage * self, GCancellable * cancellable,
++                           GAsyncReadyCallback callback, gpointer user_data)
++{
++  GTask * task;
++  ExtractSigfmData * data = g_new0 (ExtractSigfmData, 1);
++
++  task = g_task_new (self, cancellable, fp_image_sigfm_extract_cb, user_data);
++
++  data->image = g_malloc (self->width * self->height);
++  memcpy (data->image, self->data, self->width * self->height);
++  data->width = self->width;
++  data->height = self->height;
++  data->user_cb = callback;
++
++  g_task_set_task_data (task, data,
++                        (GDestroyNotify) fp_image_sigfm_extract_free);
++  g_task_run_in_thread (task, fp_image_sigfm_extract_thread_func);
++}
++
++/**
+  * fp_image_detect_minutiae:
+  * @self: A #FpImage
+  * @cancellable: a #GCancellable, or %NULL
+diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/fp-image-device.c libfprint/libfprint/fp-image-device.c
+--- a/libfprint/fp-image-device.c
++++ b/libfprint/fp-image-device.c
+@@ -17,6 +17,7 @@
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
+ 
++#include "fpi-print.h"
+ #define FP_COMPONENT "image_device"
+ #include "fpi-log.h"
+ 
+@@ -32,15 +33,12 @@
+  * This is a helper class for the commonly found image based devices.
+  */
+ 
+-G_DEFINE_ABSTRACT_TYPE_WITH_PRIVATE (FpImageDevice, fp_image_device, FP_TYPE_DEVICE)
++G_DEFINE_ABSTRACT_TYPE_WITH_PRIVATE (FpImageDevice, fp_image_device,
++                                     FP_TYPE_DEVICE)
+ 
+-enum {
+-  PROP_0,
+-  PROP_FPI_STATE,
+-  N_PROPS
+-};
++enum { PROP_0, PROP_FPI_STATE, N_PROPS };
+ 
+-static GParamSpec *properties[N_PROPS];
++static GParamSpec * properties[N_PROPS];
+ 
+ enum {
+   FPI_STATE_CHANGED,
+@@ -48,7 +46,7 @@
+   LAST_SIGNAL
+ };
+ 
+-static guint signals[LAST_SIGNAL] = { 0 };
++static guint signals[LAST_SIGNAL] = {0};
+ 
+ /*******************************************************/
+ 
+@@ -58,9 +56,9 @@
+ 
+ /* Callbacks/vfuncs */
+ static void
+-fp_image_device_open (FpDevice *device)
++fp_image_device_open (FpDevice * device)
+ {
+-  FpImageDeviceClass *cls = FP_IMAGE_DEVICE_GET_CLASS (device);
++  FpImageDeviceClass * cls = FP_IMAGE_DEVICE_GET_CLASS (device);
+ 
+   /* Nothing special about opening an image device, just
+    * forward the request. */
+@@ -68,20 +66,20 @@
+ }
+ 
+ static void
+-fp_image_device_close (FpDevice *device)
++fp_image_device_close (FpDevice * device)
+ {
+-  FpImageDevice *self = FP_IMAGE_DEVICE (device);
+-  FpImageDeviceClass *cls = FP_IMAGE_DEVICE_GET_CLASS (self);
+-  FpImageDevicePrivate *priv = fp_image_device_get_instance_private (self);
++  FpImageDevice * self = FP_IMAGE_DEVICE (device);
++  FpImageDeviceClass * cls = FP_IMAGE_DEVICE_GET_CLASS (self);
++  FpImageDevicePrivate * priv = fp_image_device_get_instance_private (self);
+ 
+   g_assert (priv->active == FALSE);
+   cls->img_close (self);
+ }
+ 
+ static void
+-fp_image_device_cancel_action (FpDevice *device)
++fp_image_device_cancel_action (FpDevice * device)
+ {
+-  FpImageDevice *self = FP_IMAGE_DEVICE (device);
++  FpImageDevice * self = FP_IMAGE_DEVICE (device);
+   FpiDeviceAction action;
+ 
+   action = fpi_device_get_current_action (device);
+@@ -96,12 +94,11 @@
+ }
+ 
+ static void
+-fp_image_device_start_capture_action (FpDevice *device)
++fp_image_device_start_capture_action (FpDevice * device)
+ {
+-  FpImageDevice *self = FP_IMAGE_DEVICE (device);
+-  FpImageDevicePrivate *priv = fp_image_device_get_instance_private (self);
++  FpImageDevice * self = FP_IMAGE_DEVICE (device);
++  FpImageDevicePrivate * priv = fp_image_device_get_instance_private (self);
+   FpiDeviceAction action;
+-  FpiPrintType print_type;
+ 
+   /* There is just one action that we cannot support out
+    * of the box, which is a capture without first waiting
+@@ -116,18 +113,17 @@
+ 
+       if (!wait_for_finger)
+         {
+-          fpi_device_action_error (device, fpi_device_error_new (FP_DEVICE_ERROR_NOT_SUPPORTED));
++          fpi_device_action_error (
++            device, fpi_device_error_new (FP_DEVICE_ERROR_NOT_SUPPORTED));
+           return;
+         }
+     }
+   else if (action == FPI_DEVICE_ACTION_ENROLL)
+     {
+-      FpPrint *enroll_print = NULL;
++      FpPrint * enroll_print = NULL;
+ 
+       fpi_device_get_enroll_data (device, &enroll_print);
+-      g_object_get (enroll_print, "fpi-type", &print_type, NULL);
+-      if (print_type != FPI_PRINT_NBIS)
+-        fpi_print_set_type (enroll_print, FPI_PRINT_NBIS);
++      fpi_print_set_type (enroll_print, priv->algorithm);
+     }
+ 
+   priv->enroll_stage = 0;
+@@ -140,14 +136,13 @@
+   fpi_image_device_activate (self);
+ }
+ 
+-
+ /*********************************************************/
+ 
+ static void
+-fp_image_device_finalize (GObject *object)
++fp_image_device_finalize (GObject * object)
+ {
+-  FpImageDevice *self = (FpImageDevice *) object;
+-  FpImageDevicePrivate *priv = fp_image_device_get_instance_private (self);
++  FpImageDevice * self = (FpImageDevice *) object;
++  FpImageDevicePrivate * priv = fp_image_device_get_instance_private (self);
+ 
+   g_assert (priv->active == FALSE);
+ 
+@@ -155,25 +150,23 @@
+ }
+ 
+ static void
+-fp_image_device_default_activate (FpImageDevice *self)
++fp_image_device_default_activate (FpImageDevice * self)
+ {
+   fpi_image_device_activate_complete (self, NULL);
+ }
+ 
+ static void
+-fp_image_device_default_deactivate (FpImageDevice *self)
++fp_image_device_default_deactivate (FpImageDevice * self)
+ {
+   fpi_image_device_deactivate_complete (self, NULL);
+ }
+ 
+ static void
+-fp_image_device_get_property (GObject    *object,
+-                              guint       prop_id,
+-                              GValue     *value,
+-                              GParamSpec *pspec)
++fp_image_device_get_property (GObject * object, guint prop_id,
++                              GValue * value, GParamSpec * pspec)
+ {
+-  FpImageDevice *self = FP_IMAGE_DEVICE (object);
+-  FpImageDevicePrivate *priv = fp_image_device_get_instance_private (self);
++  FpImageDevice * self = FP_IMAGE_DEVICE (object);
++  FpImageDevicePrivate * priv = fp_image_device_get_instance_private (self);
+ 
+   switch (prop_id)
+     {
+@@ -187,25 +180,28 @@
+ }
+ 
+ static void
+-fp_image_device_constructed (GObject *obj)
++fp_image_device_constructed (GObject * obj)
+ {
+-  FpImageDevice *self = FP_IMAGE_DEVICE (obj);
+-  FpImageDevicePrivate *priv = fp_image_device_get_instance_private (self);
+-  FpImageDeviceClass *cls = FP_IMAGE_DEVICE_GET_CLASS (self);
++  FpImageDevice * self = FP_IMAGE_DEVICE (obj);
++  FpImageDevicePrivate * priv = fp_image_device_get_instance_private (self);
++  FpImageDeviceClass * cls = FP_IMAGE_DEVICE_GET_CLASS (self);
+ 
+   /* Set default threshold. */
+   priv->bz3_threshold = BOZORTH3_DEFAULT_THRESHOLD;
+   if (cls->bz3_threshold > 0)
+     priv->bz3_threshold = cls->bz3_threshold;
++  priv->algorithm = FPI_PRINT_NBIS;
++  if (cls->algorithm > 0)
++    priv->algorithm = cls->algorithm;
+ 
+   G_OBJECT_CLASS (fp_image_device_parent_class)->constructed (obj);
+ }
+ 
+ static void
+-fp_image_device_class_init (FpImageDeviceClass *klass)
++fp_image_device_class_init (FpImageDeviceClass * klass)
+ {
+-  GObjectClass *object_class = G_OBJECT_CLASS (klass);
+-  FpDeviceClass *fp_device_class = FP_DEVICE_CLASS (klass);
++  GObjectClass * object_class = G_OBJECT_CLASS (klass);
++  FpDeviceClass * fp_device_class = FP_DEVICE_CLASS (klass);
+ 
+   object_class->finalize = fp_image_device_finalize;
+   object_class->get_property = fp_image_device_get_property;
+@@ -237,13 +233,11 @@
+    *
+    * Stability: private
+    */
+-  properties[PROP_FPI_STATE] =
+-    g_param_spec_enum ("fpi-image-device-state",
+-                       "Image Device State",
+-                       "Private: The state of the image device",
+-                       FPI_TYPE_IMAGE_DEVICE_STATE,
+-                       FPI_IMAGE_DEVICE_STATE_INACTIVE,
+-                       G_PARAM_STATIC_STRINGS | G_PARAM_READABLE);
++  properties[PROP_FPI_STATE] = g_param_spec_enum (
++    "fpi-image-device-state", "Image Device State",
++    "Private: The state of the image device", FPI_TYPE_IMAGE_DEVICE_STATE,
++    FPI_IMAGE_DEVICE_STATE_INACTIVE,
++    G_PARAM_STATIC_STRINGS | G_PARAM_READABLE);
+ 
+   /**
+    * FpImageDevice::fpi-image-device-state-changed: (skip)
+@@ -254,18 +248,15 @@
+    *
+    * Stability: private
+    */
+-  signals[FPI_STATE_CHANGED] =
+-    g_signal_new ("fpi-image-device-state-changed",
+-                  G_TYPE_FROM_CLASS (object_class),
+-                  G_SIGNAL_RUN_FIRST,
+-                  G_STRUCT_OFFSET (FpImageDeviceClass, change_state),
+-                  NULL, NULL, NULL,
+-                  G_TYPE_NONE, 1, FPI_TYPE_IMAGE_DEVICE_STATE);
++  signals[FPI_STATE_CHANGED] = g_signal_new (
++    "fpi-image-device-state-changed", G_TYPE_FROM_CLASS (object_class),
++    G_SIGNAL_RUN_FIRST, G_STRUCT_OFFSET (FpImageDeviceClass, change_state),
++    NULL, NULL, NULL, G_TYPE_NONE, 1, FPI_TYPE_IMAGE_DEVICE_STATE);
+ 
+   g_object_class_install_properties (object_class, N_PROPS, properties);
+ }
+ 
+ static void
+-fp_image_device_init (FpImageDevice *self)
++fp_image_device_init (FpImageDevice * self)
+ {
+ }
+diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/fp-image-device-private.h libfprint/libfprint/fp-image-device-private.h
+--- a/libfprint/fp-image-device-private.h
++++ b/libfprint/fp-image-device-private.h
+@@ -37,6 +37,7 @@
+   FpImage            *capture_image;
+ 
+   gint                bz3_threshold;
++  FpiPrintType        algorithm;
+ } FpImageDevicePrivate;
+ 
+ 
+diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/fp-image.h libfprint/libfprint/fp-image.h
+--- a/libfprint/fp-image.h
++++ b/libfprint/fp-image.h
+@@ -20,6 +20,7 @@
+ 
+ #pragma once
+ 
++#include "sigfm/sigfm.hpp"
+ #include <gio/gio.h>
+ 
+ G_BEGIN_DECLS
+@@ -43,6 +44,11 @@
+                                         GCancellable       *cancellable,
+                                         GAsyncReadyCallback callback,
+                                         gpointer            user_data);
++
++void fp_image_extract_sigfm_info (FpImage           * self,
++                                GCancellable      * cancellable,
++                                GAsyncReadyCallback callback,
++                                gpointer            user_data);
+ gboolean      fp_image_detect_minutiae_finish (FpImage      *self,
+                                                GAsyncResult *result,
+                                                GError      **error);
+@@ -56,4 +62,6 @@
+                                       gint      *x,
+                                       gint      *y);
+ 
++SigfmImgInfo * fp_image_get_sigfm_info (FpImage * self);
++
+ G_END_DECLS
+diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/fpi-print.c libfprint/libfprint/fpi-print.c
+--- a/libfprint/fpi-print.c
++++ b/libfprint/fpi-print.c
+@@ -18,6 +18,8 @@
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
+ 
++#include "fpi-print.h"
++#include "sigfm/sigfm.hpp"
+ #define FP_COMPONENT "print"
+ #include "fpi-log.h"
+ 
+@@ -39,18 +41,26 @@
+  * @print: A #FpPrint
+  * @add: Print to append to @print
+  *
+- * Appends the single #FPI_PRINT_NBIS print from @add to the collection of
+- * prints in @print. Both print objects need to be of type #FPI_PRINT_NBIS
+- * for this to work.
++ * Appends the single #FPI_PRINT_NBIS or #FPI_PRINT_SIGFM print from @add
++ * to the collection of prints in @print. Both print objects need to be of
++ * the same type for this to work.
+  */
+ void
+ fpi_print_add_print (FpPrint *print, FpPrint *add)
+ {
+-  g_return_if_fail (print->type == FPI_PRINT_NBIS);
+-  g_return_if_fail (add->type == FPI_PRINT_NBIS);
++  g_return_if_fail (print->type == FPI_PRINT_NBIS ||
++                    print->type == FPI_PRINT_SIGFM);
++  g_return_if_fail (add->type == FPI_PRINT_NBIS ||
++                    add->type == FPI_PRINT_SIGFM);
++  g_return_if_fail (add->type == print->type);
++  g_return_if_fail (add->prints->len > 0);
+ 
+   g_assert (add->prints->len == 1);
+-  g_ptr_array_add (print->prints, g_memdup2 (add->prints->pdata[0], sizeof (struct xyt_struct)));
++  void * to_add =
++    print->type == FPI_PRINT_NBIS ?
++    g_memdup2 (add->prints->pdata[0], sizeof (struct xyt_struct)) :
++    (void *) sigfm_copy_info (add->prints->pdata[0]);
++  g_ptr_array_add (print->prints, to_add);
+ }
+ 
+ /**
+@@ -71,10 +81,12 @@
+   g_return_if_fail (print->type == FPI_PRINT_UNDEFINED);
+ 
+   print->type = type;
+-  if (print->type == FPI_PRINT_NBIS)
++  if (print->type == FPI_PRINT_NBIS || print->type == FPI_PRINT_SIGFM)
+     {
+       g_assert_null (print->prints);
+-      print->prints = g_ptr_array_new_with_free_func (g_free);
++      print->prints = g_ptr_array_new_with_free_func (
++        print->type == FPI_PRINT_NBIS ? g_free :
++        (void (*)(void *))(sigfm_free_info));
+     }
+   g_object_notify (G_OBJECT (print), "fpi-type");
+ }
+@@ -144,7 +156,7 @@
+  * @error: Return location for error
+  *
+  * Extracts the minutiae from the given image and adds it to @print of
+- * type #FPI_PRINT_NBIS.
++ * type #FPI_PRINT_NBIS or #FPI_PRINT_SIGFM.
+  *
+  * The @image will be kept so that API users can get retrieve it e.g.
+  * for debugging purposes.
+@@ -160,7 +172,8 @@
+   struct fp_minutiae _minutiae;
+   struct xyt_struct *xyt;
+ 
+-  if (print->type != FPI_PRINT_NBIS || !image)
++  if ((print->type != FPI_PRINT_NBIS && print->type != FPI_PRINT_SIGFM) ||
++      !image)
+     {
+       g_set_error (error,
+                    G_IO_ERROR,
+@@ -168,24 +181,29 @@
+                    "Cannot add print data from image!");
+       return FALSE;
+     }
+-
+-  minutiae = fp_image_get_minutiae (image);
+-  if (!minutiae || minutiae->len == 0)
++  if (print->type == FPI_PRINT_NBIS)
+     {
+-      g_set_error (error,
+-                   G_IO_ERROR,
+-                   G_IO_ERROR_INVALID_DATA,
+-                   "No minutiae found in image or not yet detected!");
+-      return FALSE;
++      minutiae = fp_image_get_minutiae (image);
++      if (!minutiae || minutiae->len == 0)
++        {
++          g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
++                       "No minutiae found in image or not yet detected!");
++          return FALSE;
++        }
++
++      _minutiae.num = minutiae->len;
++      _minutiae.list = (struct fp_minutia **) minutiae->pdata;
++      _minutiae.alloc = minutiae->len;
++
++      xyt = g_new0 (struct xyt_struct, 1);
++      minutiae_to_xyt (&_minutiae, image->width, image->height, xyt);
++      g_ptr_array_add (print->prints, xyt);
++    }
++  else if (print->type == FPI_PRINT_SIGFM)
++    {
++      SigfmImgInfo * info = fp_image_get_sigfm_info (image);
++      g_ptr_array_add (print->prints, info);
+     }
+-
+-  _minutiae.num = minutiae->len;
+-  _minutiae.list = (struct fp_minutia **) minutiae->pdata;
+-  _minutiae.alloc = minutiae->len;
+-
+-  xyt = g_new0 (struct xyt_struct, 1);
+-  minutiae_to_xyt (&_minutiae, image->width, image->height, xyt);
+-  g_ptr_array_add (print->prints, xyt);
+ 
+   g_clear_object (&print->image);
+   print->image = g_object_ref (image);
+@@ -217,7 +235,7 @@
+   gint i;
+ 
+   /* XXX: Use a different error type? */
+-  if (template->type != FPI_PRINT_NBIS || print->type != FPI_PRINT_NBIS)
++  if (template->type != FPI_PRINT_NBIS)
+     {
+       *error = fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
+                                          "It is only possible to match NBIS type print data");
+@@ -249,6 +267,51 @@
+   return FPI_MATCH_FAIL;
+ }
+ 
++/**
++ * fpi_print_sigfm_match:
++ * @template: A #FpPrint containing one or more prints
++ * @print: A newly scanned #FpPrint to test
++ * @bz3_threshold: The BZ3 match threshold
++ * @error: Return location for error
++ *
++ * Match the newly scanned @print (containing exactly one print) against the
++ * prints contained in @template which will have been stored during enrollment.
++ *
++ * Both @template and @print need to be of type #FPI_PRINT_SIGFM for this to
++ * work.
++ *
++ * Returns: Whether the prints match, @error will be set if #FPI_MATCH_ERROR is returned
++ */
++FpiMatchResult
++fpi_print_sigfm_match (FpPrint * template, FpPrint * print,
++                     gint bz3_threshold, GError ** error)
++{
++  if (template->type != FPI_PRINT_SIGFM)
++    {
++      *error = fpi_device_error_new_msg (
++        FP_DEVICE_ERROR_NOT_SUPPORTED,
++        "Cannot call sigfm match with non-sigfm print data, type was %d",
++        template->type);
++      return FPI_MATCH_ERROR;
++    }
++  SigfmImgInfo * against = g_ptr_array_index (print->prints, 0);
++  for (int i = 0; i != template->prints->len; ++i)
++    {
++      SigfmImgInfo * pinfo = g_ptr_array_index (template->prints, i);
++      int score = sigfm_match_score (pinfo, against);
++      if (score < 0)
++        {
++          *error = fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
++                                             "error in sigfm_match_score");
++          return FPI_MATCH_ERROR;
++        }
++      fp_dbg ("sigfm score %d/%d", score, bz3_threshold);
++      if (score >= bz3_threshold)
++        return FPI_MATCH_SUCCESS;
++    }
++  return FPI_MATCH_FAIL;
++}
++
+ /**
+  * fpi_print_generate_user_id:
+  * @print: #FpPrint to generate the ID for
+diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/fpi-print.h libfprint/libfprint/fpi-print.h
+--- a/libfprint/fpi-print.h
++++ b/libfprint/fpi-print.h
+@@ -11,11 +11,13 @@
+  * @FPI_PRINT_UNDEFINED: Undefined type, this happens prior to enrollment
+  * @FPI_PRINT_RAW: A raw print where the data is directly compared
+  * @FPI_PRINT_NBIS: NBIS minutiae comparison
++ * @FPI_PRINT_SIGFM: SIGFM minutiae comparison
+  */
+ typedef enum {
+   FPI_PRINT_UNDEFINED = 0,
+   FPI_PRINT_RAW,
+   FPI_PRINT_NBIS,
++  FPI_PRINT_SIGFM,
+ } FpiPrintType;
+ 
+ /**
+@@ -47,8 +49,11 @@
+                                     gint     bz3_threshold,
+                                     GError **error);
+ 
++FpiMatchResult fpi_print_sigfm_match (FpPrint * template, FpPrint * print,
++                                    gint bz3_threshold, GError * *error);
++
+ /* Helpers to encode metadata into user ID strings. */
+-gchar *  fpi_print_generate_user_id (FpPrint *print);
++gchar * fpi_print_generate_user_id (FpPrint * print);
+ gboolean fpi_print_fill_from_user_id (FpPrint    *print,
+                                       const char *user_id);
+ 
+diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/fp-print.c libfprint/libfprint/fp-print.c
+--- a/libfprint/fp-print.c
++++ b/libfprint/fp-print.c
+@@ -18,6 +18,7 @@
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
+ 
++#include "sigfm/sigfm.hpp"
+ #define FP_COMPONENT "print"
+ 
+ #include "fp-print-private.h"
+@@ -680,6 +681,8 @@
+   g_variant_builder_open (&builder, G_VARIANT_TYPE_VARDICT);
+   g_variant_builder_close (&builder);
+ 
++  GPtrArray * to_free = g_ptr_array_new ();
++
+   /* Insert NBIS print data for type NBIS, otherwise the GVariant directly */
+   if (print->type == FPI_PRINT_NBIS)
+     {
+@@ -714,6 +717,26 @@
+       g_variant_builder_close (&nested);
+       g_variant_builder_add (&builder, "v", g_variant_builder_end (&nested));
+     }
++  else if (print->type == FPI_PRINT_SIGFM)
++    {
++      GVariantBuilder nested =
++        G_VARIANT_BUILDER_INIT (G_VARIANT_TYPE ("(a(ay))"));
++      g_variant_builder_open (&nested, G_VARIANT_TYPE ("a(ay)"));
++      for (int i = 0; i != print->prints->len; ++i)
++        {
++          g_variant_builder_open (&nested, G_VARIANT_TYPE ("(ay)"));
++          SigfmImgInfo * info = g_ptr_array_index (print->prints, i);
++          int slen;
++          unsigned char * serialized = sigfm_serialize_binary (info, &slen);
++          g_variant_builder_add_value (
++            &nested, g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
++                                                serialized, slen, 1));
++          g_ptr_array_add (to_free, serialized);
++          g_variant_builder_close (&nested);
++        }
++      g_variant_builder_close (&nested);
++      g_variant_builder_add (&builder, "v", g_variant_builder_end (&nested));
++    }
+   else
+     {
+       g_variant_builder_add (&builder, "v", g_variant_new_variant (print->data));
+@@ -742,6 +765,7 @@
+ 
+   g_variant_get_data (result);
+   g_variant_store (result, (*data) + 3);
++  g_clear_object (&to_free);
+ 
+   return TRUE;
+ }
+@@ -870,6 +894,35 @@
+           g_ptr_array_add (result->prints, g_steal_pointer (&xyt));
+         }
+     }
++  else if (type == FPI_PRINT_SIGFM)
++    {
++      g_autoptr(GVariant) prints = g_variant_get_child_value (print_data, 0);
++      guint i;
++
++      result = g_object_new (FP_TYPE_PRINT, "driver", driver, "device-id",
++                             device_id, "device-stored", device_stored, NULL);
++      g_object_ref_sink (result);
++      fpi_print_set_type (result, FPI_PRINT_SIGFM);
++
++      for (i = 0; i < g_variant_n_children (prints); i++)
++        {
++          g_autoptr(GVariant) sigfm_data = NULL;
++
++          sigfm_data = g_variant_get_child_value (prints, i);
++
++          GVariant * child = g_variant_get_child_value (sigfm_data, 0);
++          gsize slen;
++          const unsigned char * serialized =
++            g_variant_get_fixed_array (child, &slen, sizeof (unsigned char));
++          g_variant_unref (child);
++
++          SigfmImgInfo * sigfm_info = sigfm_deserialize_binary (serialized, slen);
++          if (!sigfm_info)
++            goto invalid_format;
++
++          g_ptr_array_add (result->prints, g_steal_pointer (&sigfm_info));
++        }
++    }
+   else if (type == FPI_PRINT_RAW)
+     {
+       g_autoptr(GVariant) fp_data = g_variant_get_child_value (print_data, 0);
+diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/meson.build libfprint/libfprint/meson.build
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -141,6 +141,8 @@
+         [ 'drivers/goodixmoc/goodix.c', 'drivers/goodixmoc/goodix_proto.c' ],
+     'goodixtls511' :
+         [ 'drivers/goodixtls/goodix511.c' ],
++    'goodixtls53xd' :
++        [ 'drivers/goodixtls/goodix53xd.c' ],
+     'fpcmoc' :
+         [ 'drivers/fpcmoc/fpc.c' ],
+ }
+@@ -228,6 +230,8 @@
+     mathlib_dep,
+ ] + optional_deps
+ 
++subdir('sigfm')
++
+ # These are empty and only exist so that the include directories are created
+ # in the build tree. This silences a build time warning.
+ subdir('nbis/include')
+@@ -250,13 +254,15 @@
+     ]),
+     install: false)
+ 
++priv_deps = deps + libsigfm
++
+ libfprint_private = static_library('fprint-private',
+     sources: [
+         fpi_enums,
+         libfprint_private_sources,
+     ],
+     dependencies: deps,
+-    link_with: libnbis,
++    link_with: [libnbis, libsigfm],
+     install: false)
+ 
+ libfprint_drivers = static_library('fprint-drivers',
+diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/sigfm/binary.hpp libfprint/libfprint/sigfm/binary.hpp
+--- a/libfprint/sigfm/binary.hpp
++++ b/libfprint/sigfm/binary.hpp
+@@ -0,0 +1,215 @@
++
++#pragma once
++
++#include "opencv2/core/mat.hpp"
++#include <array>
++#include <cstring>
++#include <stdexcept>
++#include <type_traits>
++#include <vector>
++
++namespace bin {
++using byte = unsigned char;
++
++class stream;
++
++template<typename T>
++struct serializer : public std::false_type {
++    void serialize(const T& m, stream& out);
++};
++
++template<typename T>
++struct deserializer : public std::false_type {
++    T deserialize(stream& in);
++};
++class stream {
++public:
++    stream() = default;
++
++    template<
++        typename Iter,
++        std::enable_if_t<std::is_same_v<typename std::iterator_traits<
++                                            std::decay_t<Iter>>::value_type,
++                                        byte>,
++                         bool> = true>
++    stream(Iter begin, Iter end) : store_{begin, end}
++    {
++    }
++
++    template<typename T, std::enable_if_t<serializer<T>::value, bool> = true>
++    constexpr stream& operator<<(T v)
++    {
++        serializer<T>::serialize(v, *this);
++        return *this;
++    }
++
++    template<typename T, std::enable_if_t<deserializer<T>::value, bool> = true>
++    constexpr stream& operator>>(T& v)
++    {
++        v = deserializer<T>::deserialize(*this);
++        return *this;
++    }
++    template<typename T, std::enable_if_t<std::is_trivial_v<T>, bool> = true>
++    constexpr stream& operator<<(T v)
++    {
++        using seg_store = std::array<byte, sizeof(T)>;
++        alignas(T) seg_store s = {};
++        std::memcpy(s.data(), &v, sizeof(T));
++        stream::write(s.begin(), s.end());
++        return *this;
++    }
++
++    template<typename T, std::enable_if_t<std::is_trivial_v<T>, bool> = true>
++    constexpr stream& operator>>(T& v)
++    {
++        using seg_store = std::array<byte, sizeof(T)>;
++        alignas(T) seg_store s = {};
++        if (store_.size() < s.size()) {
++            throw std::runtime_error{"tried to extract from too small stream"};
++        }
++        stream::read(s.begin(), s.end());
++        memcpy(&v, s.data(), sizeof(T));
++        return *this;
++    }
++    template<
++        typename Iter,
++        std::enable_if_t<std::is_same_v<typename std::iterator_traits<
++                                            std::decay_t<Iter>>::value_type,
++                                        byte>,
++                         bool> = true>
++    constexpr stream& write(Iter&& begin, Iter&& end)
++    {
++        std::copy(std::forward<Iter>(begin), std::forward<Iter>(end),
++                  std::back_inserter(store_));
++        return *this;
++    }
++
++    template<typename T, std::enable_if_t<serializer<T>::value, bool> = true>
++    stream& serialize(const T& m, stream& out)
++    {
++        serializer<T>::serialize(m, out);
++        return out;
++    }
++
++    template<
++        typename Iter,
++        std::enable_if_t<std::is_same_v<typename std::iterator_traits<
++                                            std::decay_t<Iter>>::value_type,
++                                        byte>,
++                         bool> = true>
++    constexpr stream& read(Iter&& begin, Iter&& end)
++    {
++        const auto dist = std::distance(begin, end);
++        return stream::read(begin, dist);
++    }
++
++    template<
++        typename Iter,
++        std::enable_if_t<std::is_same_v<typename std::iterator_traits<
++                                            std::decay_t<Iter>>::value_type,
++                                        byte>,
++                         bool> = true>
++    constexpr stream& read(Iter&& begin, std::size_t dist)
++    {
++        std::copy(store_.begin(), store_.begin() + dist, begin);
++        store_.erase(store_.begin(), store_.begin() + dist);
++        return *this;
++    }
++    byte* copy_buffer() const
++    {
++        byte* raw = static_cast<byte*>(malloc(store_.size()));
++        std::copy(store_.begin(), store_.end(), raw);
++        return raw;
++    }
++    std::size_t size() const { return store_.size(); }
++
++private:
++    std::vector<byte> store_;
++};
++
++template<>
++struct serializer<cv::Mat> : public std::true_type {
++    static void serialize(const cv::Mat& m, stream& out)
++    {
++        out << m.type() << m.rows << m.cols;
++        out.write(m.datastart, m.dataend);
++    }
++};
++
++template<>
++struct deserializer<cv::Mat> : public std::true_type {
++    static cv::Mat deserialize(stream& in)
++    {
++        int rows, cols, type;
++        in >> type >> rows >> cols;
++        cv::Mat m;
++        m.create(rows, cols, type);
++        in.read(m.data, std::distance(m.datastart, m.dataend));
++        return m;
++    }
++};
++
++template<typename T>
++struct deserializer<cv::Point_<T>> : public std::true_type {
++    static cv::Point2f deserialize(stream& in)
++    {
++        cv::Point_<T> p;
++        in >> p.x >> p.y;
++        return p;
++    }
++};
++template<typename T>
++struct serializer<cv::Point_<T>> : public std::true_type {
++    static void serialize(const cv::Point_<T>& pt, stream& out)
++    {
++        out << pt.x << pt.y;
++    }
++};
++
++template<>
++struct serializer<cv::KeyPoint> : public std::true_type {
++    static void serialize(const cv::KeyPoint& pt, stream& out)
++    {
++        out << pt.class_id << pt.angle << pt.octave << pt.response << pt.size
++            << pt.pt;
++    }
++};
++
++template<>
++struct deserializer<cv::KeyPoint> : public std::true_type {
++    static cv::KeyPoint deserialize(stream& in)
++    {
++        cv::KeyPoint pt;
++        in >> pt.class_id >> pt.angle >> pt.octave >> pt.response >> pt.size >>
++            pt.pt;
++        return pt;
++    }
++};
++
++template<typename T>
++struct serializer<std::vector<T>> : public std::true_type {
++    static void serialize(const std::vector<T>& vs, stream& out)
++    {
++        out << static_cast<std::size_t>(vs.size());
++        std::for_each(vs.begin(), vs.end(),
++                      [&out](const auto& el) { out << el; });
++    }
++};
++
++template<typename T>
++struct deserializer<std::vector<T>> : public std::true_type {
++    static std::vector<T> deserialize(stream& in)
++    {
++        std::size_t size;
++        in >> size;
++        std::vector<T> vs;
++        vs.reserve(size);
++        for (std::size_t n = 0; n != size; ++n) {
++            T v;
++            in >> v;
++            vs.emplace_back(std::move(v));
++        }
++        return vs;
++    }
++};
++} // namespace bin
+diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/sigfm/img-info.hpp libfprint/libfprint/sigfm/img-info.hpp
+--- a/libfprint/sigfm/img-info.hpp
++++ b/libfprint/sigfm/img-info.hpp
+@@ -0,0 +1,10 @@
++
++#pragma once
++
++#include <opencv2/core.hpp>
++#include <vector>
++
++struct SigfmImgInfo {
++    std::vector<cv::KeyPoint> keypoints;
++    cv::Mat descriptors;
++};
+\ Manca newline alla fine del file
+diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/sigfm/meson.build libfprint/libfprint/sigfm/meson.build
+--- a/libfprint/sigfm/meson.build
++++ b/libfprint/sigfm/meson.build
+@@ -0,0 +1,27 @@
++
++sigfm_sources = ['sigfm.cpp']
++
++opencv = dependency('opencv4', required: false, version: '>=4.5.0')
++if not opencv.found()
++    # Ubuntu ships opencv4.pc only in libopencv-dev, which pulls in every
++    # OpenCV module; SIGFM only needs core and features2d.
++    cxx = meson.get_compiler('cpp')
++    opencv = declare_dependency(
++        compile_args: ['-I/usr/include/opencv4'],
++        dependencies: [
++            cxx.find_library('opencv_core', required: true),
++            cxx.find_library('opencv_features2d', required: true),
++        ],
++    )
++endif
++doctest = dependency('doctest', required: false, version: ['>=2.0.0', '<3.0.0'])
++
++libsigfm = static_library('sigfm',
++        sigfm_sources,
++        # goodixtls53xd's threshold was measured with this fix enabled
++        cpp_args: ['-DSIGFM_FIX_MATCH_ORDER'],
++        dependencies: [opencv],
++)
++if doctest.found()
++    sigfm_tests = executable('sigfm-tests', ['./tests.cpp'], dependencies: [doctest, opencv], link_with: [libsigfm])
++endif
+diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/sigfm/sigfm.cpp libfprint/libfprint/sigfm/sigfm.cpp
+--- a/libfprint/sigfm/sigfm.cpp
++++ b/libfprint/sigfm/sigfm.cpp
+@@ -0,0 +1,222 @@
++// SIGFM algorithm for libfprint
++
++// Copyright (C) 2022 Matthieu CHARETTE <matthieu.charette@gmail.com>
++// Copyright (c) 2022 Natasha England-Elbro <ashenglandelbro@protonmail.com>
++// Copyright (c) 2022 Timur Mangliev <tigrmango@gmail.com>
++
++// This library is free software; you can redistribute it and/or
++// modify it under the terms of the GNU Lesser General Public
++// License as published by the Free Software Foundation; either
++// version 2.1 of the License, or (at your option) any later version.
++
++// This library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++// Lesser General Public License for more details.
++
++// You should have received a copy of the GNU Lesser General Public
++// License along with this library; if not, write to the Free Software
++// Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++//
++
++#include "sigfm.hpp"
++#include "binary.hpp"
++#include "img-info.hpp"
++
++#include "opencv2/core.hpp"
++#include "opencv2/core/types.hpp"
++#include "opencv2/features2d.hpp"
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <iterator>
++#include <memory>
++#include <set>
++#include <string>
++#include <tuple>
++#include <vector>
++
++namespace bin {
++
++template<>
++struct serializer<SigfmImgInfo> : public std::true_type {
++    static void serialize(const SigfmImgInfo& info, stream& out)
++    {
++        out << info.keypoints << info.descriptors;
++    }
++};
++
++template<>
++struct deserializer<SigfmImgInfo> : public std::true_type {
++    static SigfmImgInfo deserialize(stream& in)
++    {
++        SigfmImgInfo info;
++        in >> info.keypoints >> info.descriptors;
++        return info;
++    }
++};
++} // namespace bin
++
++namespace {
++constexpr auto distance_match = 0.75;
++constexpr auto length_match = 0.05;
++constexpr auto angle_match = 0.05;
++constexpr auto min_match = 5;
++struct match {
++    cv::Point2i p1;
++    cv::Point2i p2;
++    match(cv::Point2i ip1, cv::Point2i ip2) : p1{ip1}, p2{ip2} {}
++    match() : p1{cv::Point2i(0, 0)}, p2{cv::Point2i(0, 0)} {}
++    bool operator==(const match& right) const
++    {
++        return std::tie(this->p1, this->p2) == std::tie(right.p1, right.p2);
++    }
++    bool operator<(const match& right) const
++    {
++#ifdef SIGFM_FIX_MATCH_ORDER
++        // Upstream only compares p1.y, so std::set merges distinct matches
++        // that share a row of the probe image.
++        return std::tie(p1.y, p1.x, p2.y, p2.x) <
++               std::tie(right.p1.y, right.p1.x, right.p2.y, right.p2.x);
++#else
++        return (this->p1.y < right.p1.y) ||
++               ((this->p1.y < right.p1.y) && this->p1.x < right.p1.x);
++#endif
++    }
++};
++struct angle {
++    double cos;
++    double sin;
++    match corr_matches[2];
++    angle(double cos_, double sin_, match m1, match m2)
++        : cos{cos_}, sin{sin_}, corr_matches{m1, m2}
++    {
++    }
++};
++} // namespace
++
++SigfmImgInfo* sigfm_copy_info(SigfmImgInfo* info) { return new SigfmImgInfo{*info}; }
++
++int sigfm_keypoints_count(SigfmImgInfo* info) { return info->keypoints.size(); }
++unsigned char* sigfm_serialize_binary(SigfmImgInfo* info, int* outlen)
++{
++    bin::stream s;
++    s << *info;
++    *outlen = s.size();
++    return s.copy_buffer();
++}
++
++SigfmImgInfo* sigfm_deserialize_binary(const unsigned char* bytes, int len)
++{
++    try {
++        bin::stream s{bytes, bytes + len};
++        auto info = std::make_unique<SigfmImgInfo>();
++        s >> *info;
++        return info.release();
++    }
++    catch (const std::exception&) {
++        return nullptr;
++    }
++}
++
++SigfmImgInfo* sigfm_extract(const SigfmPix* pix, int width, int height)
++{
++    cv::Mat img;
++    img.create(height, width, CV_8UC1);
++    std::memcpy(img.data, pix, width * height);
++    const auto roi = cv::Mat::ones(cv::Size{img.size[1], img.size[0]}, CV_8UC1);
++    std::vector<cv::KeyPoint> pts;
++
++    cv::Mat descs;
++    cv::SIFT::create()->detectAndCompute(img, roi, pts, descs);
++
++    auto* info = new SigfmImgInfo{pts, descs};
++    return info;
++}
++
++int sigfm_match_score(SigfmImgInfo* frame, SigfmImgInfo* enrolled)
++{
++    try {
++        std::vector<std::vector<cv::DMatch>> points;
++        auto bfm = cv::BFMatcher::create();
++        bfm->knnMatch(frame->descriptors, enrolled->descriptors, points, 2);
++        std::set<match> matches_unique;
++        int nb_matched = 0;
++        for (const auto& pts : points) {
++            if (pts.size() < 2) {
++                continue;
++            }
++            const cv::DMatch& match_1 = pts.at(0);
++            if (match_1.distance < distance_match * pts.at(1).distance) {
++                matches_unique.emplace(
++                    match{frame->keypoints.at(match_1.queryIdx).pt,
++                          enrolled->keypoints.at(match_1.trainIdx).pt});
++                nb_matched++;
++            }
++        }
++        if (nb_matched < min_match) {
++            return 0;
++        }
++        std::vector<match> matches{matches_unique.begin(),
++                                   matches_unique.end()};
++
++        std::vector<angle> angles;
++        for (std::size_t j = 0; j < matches.size(); j++) {
++            match match_1 = matches[j];
++            for (std::size_t k = j + 1; k < matches.size(); k++) {
++                match match_2 = matches[k];
++
++                int vec_1[2] = {match_1.p1.x - match_2.p1.x,
++                                match_1.p1.y - match_2.p1.y};
++                int vec_2[2] = {match_1.p2.x - match_2.p2.x,
++                                match_1.p2.y - match_2.p2.y};
++
++                double length_1 = sqrt(pow(vec_1[0], 2) + pow(vec_1[1], 2));
++                double length_2 = sqrt(pow(vec_2[0], 2) + pow(vec_2[1], 2));
++
++                if (1 - std::min(length_1, length_2) /
++                            std::max(length_1, length_2) <=
++                    length_match) {
++
++                    double product = length_1 * length_2;
++                    angles.emplace_back(angle(
++                        M_PI / 2 +
++                            asin((vec_1[0] * vec_2[0] + vec_1[1] * vec_2[1]) /
++                                 product),
++                        acos((vec_1[0] * vec_2[1] - vec_1[1] * vec_2[0]) /
++                             product),
++                        match_1, match_2));
++                }
++            }
++        }
++
++        if (angles.size() < min_match) {
++            return 0;
++        }
++
++        int count = 0;
++        for (std::size_t j = 0; j < angles.size(); j++) {
++            angle angle_1 = angles[j];
++            for (std::size_t k = j + 1; k < angles.size(); k++) {
++                angle angle_2 = angles[k];
++
++                if (1 - std::min(angle_1.sin, angle_2.sin) /
++                                std::max(angle_1.sin, angle_2.sin) <=
++                        angle_match &&
++                    1 - std::min(angle_1.cos, angle_2.cos) /
++                                std::max(angle_1.cos, angle_2.cos) <=
++                        angle_match) {
++
++                    count += 1;
++                }
++            }
++        }
++        return count;
++    }
++    catch (...) {
++        return -1;
++    }
++}
++
++void sigfm_free_info(SigfmImgInfo* info) { delete info; }
+diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/sigfm/sigfm.hpp libfprint/libfprint/sigfm/sigfm.hpp
+--- a/libfprint/sigfm/sigfm.hpp
++++ b/libfprint/sigfm/sigfm.hpp
+@@ -0,0 +1,98 @@
++// SIGFM algorithm for libfprint
++
++// Copyright (C) 2022 Matthieu CHARETTE <matthieu.charette@gmail.com>
++// Copyright (c) 2022 Natasha England-Elbro <ashenglandelbro@protonmail.com>
++// Copyright (c) 2022 Timur Mangliev <tigrmango@gmail.com>
++
++// This library is free software; you can redistribute it and/or
++// modify it under the terms of the GNU Lesser General Public
++// License as published by the Free Software Foundation; either
++// version 2.1 of the License, or (at your option) any later version.
++
++// This library is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++// Lesser General Public License for more details.
++
++// You should have received a copy of the GNU Lesser General Public
++// License along with this library; if not, write to the Free Software
++// Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++//
++
++#pragma once
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++typedef unsigned char SigfmPix;
++/**
++ * @brief Contains information used by the sigfm algorithm for matching
++ * @details Get one from sigfm_extract() and make sure to clean it up with sigfm_free_info()
++ * @struct SigfmImgInfo
++ */
++typedef struct SigfmImgInfo SigfmImgInfo;
++
++/**
++ * @brief Extracts information from an image for later use sigfm_match_score
++ *
++ * @param pix Pixels of the image must be width * height in length
++ * @param width Width of the image
++ * @param height Height of the image
++ * @return SigfmImgInfo* Info that can be used with the API
++ */
++SigfmImgInfo* sigfm_extract(const SigfmPix* pix, int width, int height);
++
++/**
++ * @brief Destroy an SigfmImgInfo
++ * @warning Call this instead of free() or you will get UB!
++ * @param info SigfmImgInfo to destroy
++ */
++void sigfm_free_info(SigfmImgInfo* info);
++
++/**
++ * @brief Score how closely a frame matches another
++ *
++ * @param frame Print to be checked
++ * @param enrolled Canonical print to verify against
++ * @return int Score of how closely they match, values <0 indicate error, 0 means always reject
++ */
++int sigfm_match_score(SigfmImgInfo* frame, SigfmImgInfo* enrolled);
++
++/**
++ * @brief Serialize an image info for storage
++ *
++ * @param info SigfmImgInfo to store
++ * @param outlen output: Length of the returned byte array
++ * @return unsigned* char byte array for storage, should be free'd by the callee
++ */
++unsigned char* sigfm_serialize_binary(SigfmImgInfo* info, int* outlen);
++/**
++ * @brief Deserialize an SigfmImgInfo from storage
++ *
++ * @param bytes Byte array to deserialize from
++ * @param len Length of the byte array
++ * @return SigfmImgInfo* Deserialized info, or NULL if deserialization failed
++ */
++SigfmImgInfo* sigfm_deserialize_binary(const unsigned char* bytes, int len);
++
++/**
++ * @brief Keypoints for an image. Low keypoints generally means the image is
++ * low quality for matching
++ *
++ * @param info
++ * @return int
++ */
++
++int sigfm_keypoints_count(SigfmImgInfo* info);
++
++/**
++ * @brief Copy an SigfmImgInfo
++ *
++ * @param info Source of copy
++ * @return SigfmImgInfo* Newly allocated and copied version of info
++ */
++SigfmImgInfo* sigfm_copy_info(SigfmImgInfo* info);
++
++#ifdef __cplusplus
++}
++#endif
+diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/meson.build libfprint/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -125,6 +125,7 @@
+     'upekts',
+     'goodixmoc',
+     'goodixtls511',
++    'goodixtls53xd',
+     'nb1010',
+     'fpcmoc',
+ 
+@@ -160,6 +161,7 @@
+     'uru4000' : [ 'nss' ],
+     'elanspi' : [ 'udev' ],
+     'goodixtls511' : [ 'goodixtls' ],
++    'goodixtls53xd' : [ 'goodixtls' ],
+     'virtual_image'          : [ 'virtual' ],
+     'virtual_device'         : [ 'virtual' ],
+     'virtual_device_storage' : [ 'virtual' ],
