@@ -75,6 +75,21 @@ Pick a threshold above every impostor (`I`) score and check how many genuine
 (`G`) probes from the other session pass it. Same-session probes score far
 higher than real unlocks and must not be used to set the threshold.
 
+## Overlap between enrolled samples
+
+`sigfm-print-pairs.c` reads a print that fprintd stored and prints the SIGFM
+score of every enrolled sample against every other one: how much the enroll
+touches overlap. It prints only scores and keypoint counts. The build
+command is at the top of the file; the print file is readable only by root
+(7 is the right index finger):
+
+```bash
+sudo sh -c 'work/sigfm-print-pairs /var/lib/fprint/$SUDO_USER/goodixtls53xd/*/7'
+```
+
+docs/NOTES.md explains why heavy overlap around the usual touch area is good
+on this sensor.
+
 `driver-image-test.c` runs the driver's own `build_image()` on a dump, to
 check it stays byte-identical to `sigfm-eval.cpp` after changes.
 `nbis-eval.c` is the NBIS/bozorth3 counterpart: it shows why NBIS cannot
