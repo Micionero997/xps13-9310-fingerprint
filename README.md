@@ -23,8 +23,10 @@ Tested on one XPS 13 9310 2-in-1 with Ubuntu 26.10 and GNOME.
 > to 134 against a threshold of 10. Genuine and impostor scores overlap: no
 > threshold rejects the other fingers and still leaves the reader usable.
 > Someone else can likely unlock your session within a few tries.
-> **Do not use it for `sudo`, polkit or anything that grants privileges.**
-> Treat lock-screen unlock as a convenience that gives no real protection.
+> **Do not use it for `sudo`, `su`, polkit or anything that grants
+> privileges.** Treat lock-screen unlock as a convenience that gives no real
+> protection. Unlocking 1Password with it needs polkit and carries this risk;
+> [docs/1password.md](docs/1password.md) explains it before the setup.
 > Measure your own unit with `tools/verify-test.sh` (see
 > [tools/README.md](tools/README.md)).
 
@@ -43,7 +45,9 @@ Tested on one XPS 13 9310 2-in-1 with Ubuntu 26.10 and GNOME.
   of other fingers is accepted (see the warning above). An earlier offline
   estimate, with no impostor accepted, turned out to be far too optimistic.
   Your password keeps working everywhere. On a default Ubuntu install `sudo`
-  does not use the fingerprint; keep it that way.
+  does not use the fingerprint; keep it that way. Do not enable
+  "Fingerprint authentication" in `pam-auth-update`: it adds the fingerprint
+  to `su`, `sudo` and every polkit prompt.
 - Unofficial and unsupported by Dell, Goodix or libfprint. Use at your own risk.
 
 ## Requirements
@@ -103,6 +107,12 @@ after closing the lid. The first login needs the password to unlock the GNOME
 keyring (saved Wi-Fi, browser and app passwords). At that point the login
 screen does not query fprintd at all, so the reader stays silent.
 
+## 1Password (optional, weakens security)
+
+1Password can unlock with the fingerprint through polkit. This also lets the
+fingerprint approve administrator prompts such as `pkexec`. Read the risk and
+the setup in [docs/1password.md](docs/1password.md).
+
 ## Uninstall
 
 ```bash
@@ -111,6 +121,7 @@ sudo bash scripts/uninstall-fprintd.sh
 
 fprintd goes back to the system libfprint. Remove enrolled prints from
 Settings first if you no longer want them. The sensor keeps the known key.
+If you set up 1Password unlock, also run `sudo rm /etc/pam.d/polkit-1`.
 
 ## Troubleshooting
 
