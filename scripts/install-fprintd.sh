@@ -8,7 +8,9 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 lib="$root/work/libfprint/build/libfprint/libfprint-2.so.2.0.0"
+pam_module="$root/work/pam/pam_fprintd.so"
 dest=/usr/local/lib/goodix53xd
+gdm_pam=/etc/pam.d/gdm-fingerprint
 dropin_dir=/etc/systemd/system/fprintd.service.d
 # Raw frames written if FP_GOODIX53XD_DUMP was ever set for fprintd while
 # debugging (biometric data)
@@ -28,6 +30,19 @@ Environment=LD_LIBRARY_PATH=$dest
 EOF
 
 rm -rf "$old_dump"
+
+# Lock screen: use pam_fprintd with the claim retry (build-pam-fprintd.sh),
+# so a busy device on resume does not drop fingerprint from the unlock
+# prompt. Three tries, the fprintd default, written out.
+if [ -f "$pam_module" ] && [ -f "$gdm_pam" ]; then
+  install -m 644 "$pam_module" "$dest/pam_fprintd.so"
+  [ -e "$gdm_pam.goodix53xd-orig" ] || cp -p "$gdm_pam" "$gdm_pam.goodix53xd-orig"
+  sed -i -E "s|^(auth[[:space:]]+required[[:space:]]+)pam_fprintd\.so.*$|\1$dest/pam_fprintd.so max-tries=3|" "$gdm_pam"
+  grep -q "^auth.*$dest/pam_fprintd.so" "$gdm_pam" ||
+    echo "warning: no 'auth required pam_fprintd.so' line in $gdm_pam, left unchanged" >&2
+else
+  echo "note: $pam_module not built, lock screen keeps the system pam_fprintd" >&2
+fi
 
 systemctl daemon-reload
 systemctl restart fprintd

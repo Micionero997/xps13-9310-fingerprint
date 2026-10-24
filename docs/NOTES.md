@@ -59,6 +59,17 @@ Ubuntu 26.10. They explain the choices in `patches/` and `flash/`.
   base `0xa5`) saturate or return all zeros on this unit.
 - The FDT finger-down event fires on first contact. The driver keeps
   sampling until coverage is stable, then submits the best frame.
+- **FDT also fires with nothing on the sensor.** The finger-down thresholds
+  in the FDT payload are fixed values from goodix-fp-dump, taken on another
+  unit. After a suspend and a hibernation on 2026-10-24, six verifies in a
+  row ended in `verify-no-match` within 2 seconds with no touch, and fprintd
+  showed `finger-present: true`. Each one cost a PAM try, so `sudo` fell back
+  to the password at once and the lock screen used up its 3 tries in about
+  5 seconds. The driver now reports a finger only once a frame covers ≥ 15%
+  of the sensor (real touches: 38–100%, empty sensor: 0–6%). If none does
+  within the 10 polls, it drops the event, refreshes the background and
+  re-arms FDT after 250 ms. Computing the thresholds from the FDT-mode reply
+  would be the real fix, but its format is not known for 53xd.
 - Lift is detected by polling frames, because no finger-up FDT payload is
   known for 53xd. A frame with median > 3000 is "empty" and becomes the new
   background. Sessions often start with the finger still on the sensor, so
