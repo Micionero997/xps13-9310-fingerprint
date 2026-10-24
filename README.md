@@ -83,6 +83,13 @@ finger. Move the finger a little between touches: the sensor is small, so
 covering different areas matters for later matches. Lock the screen
 (Super+L) and unlock with that finger.
 
+**The first login after boot always asks for the password.** This is how
+GNOME works, not a driver problem. GNOME Shell offers the fingerprint only to
+unlock a session that is already running: the lock screen, after suspend, or
+after closing the lid. The first login needs the password to unlock the GNOME
+keyring (saved Wi-Fi, browser and app passwords). At that point the login
+screen does not query fprintd at all, so the reader stays silent.
+
 ## Uninstall
 
 ```bash
@@ -94,6 +101,8 @@ Settings first if you no longer want them. The sensor keeps the known key.
 
 ## Troubleshooting
 
+- No fingerprint prompt on the login screen right after boot: expected, see
+  [Install](#install). Lock the screen and the fingerprint works.
 - `fprintd-list $USER` should show "Goodix TLS Fingerprint Sensor 53xd".
 - `journalctl -u fprintd -b` shows driver errors.
 - To see the matcher scores, run a libfprint example with debug output:
