@@ -110,3 +110,24 @@ Ubuntu 26.10. They explain the choices in `patches/` and `flash/`.
     authentication.** Better separation would need a different matcher or
     much better images, and should be confirmed with verify-test.sh on many
     more impostor touches.
+- **Rejecting near-duplicate enroll touches made it worse** (tried on
+  2026-10-24, not kept). Idea: while enrolling, refuse a touch whose SIGFM
+  score against an already enrolled sample is ≥ 500, so that the 15 samples
+  cover more of the finger.
+  - `tools/sigfm-print-pairs.c` scored the samples of the print enrolled in
+    Settings against each other. Two pairs were near copies (6405 and 9073)
+    and five samples overlapped heavily (100–700). Every one of them came
+    from the area the finger usually lands on. Five samples matched no other
+    sample above 10.
+  - With the filter the re-enrolled print had no pair above 140. Through
+    fprintd the enrolled finger was accepted in **12/30** touches (40%),
+    against 19/30 before. The first 10 touches, the most natural ones,
+    passed 2/10 against 8/10. Other fingers were accepted in 4/30 against
+    7/30.
+  - With 30 touches neither difference is conclusive (Fisher p = 0.12 and
+    0.51), but the genuine drop is large and showed up in normal use too.
+  - Likely reason: the images are noisy, so several samples of the usual
+    touch area raise the chance that one of them matches. Forcing each
+    sample to a new area leaves one or two samples there. Overlapping enroll
+    samples are redundancy, not waste: enroll mostly on the centre of the
+    pad with small moves.
