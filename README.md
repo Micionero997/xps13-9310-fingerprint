@@ -1,8 +1,9 @@
 # Fingerprint reader on the Dell XPS 13 9310 2-in-1 (Goodix 27c6:532d) on Ubuntu
 
 The Goodix `27c6:532d` reader in the XPS 13 9310 2-in-1 has no Linux driver.
-This repository makes it work with fprintd, so you can unlock the screen and
-log in with your fingerprint from GNOME. It provides:
+This repository makes it work with fprintd, so you can unlock the GNOME lock
+screen with your fingerprint. Read the warning below on how weak the matching
+is. It provides:
 
 - a **libfprint driver** (`goodixtls53xd`) built on the
   [goodix-fp-linux-dev libfprint fork](https://github.com/goodix-fp-linux-dev/libfprint),
@@ -14,6 +15,19 @@ log in with your fingerprint from GNOME. It provides:
 
 Tested on one XPS 13 9310 2-in-1 with Ubuntu 26.10 and GNOME.
 
+> [!WARNING]
+> **This reader does not tell fingers apart reliably.** The test ran through
+> fprintd with a print enrolled in GNOME Settings, on one unit and one person.
+> The enrolled finger was accepted in **19 of 30** touches (63%). Touches of
+> six *other* fingers were accepted in **7 of 30** (23%), with scores from 10
+> to 134 against a threshold of 10. Genuine and impostor scores overlap: no
+> threshold rejects the other fingers and still leaves the reader usable.
+> Someone else can likely unlock your session within a few tries.
+> **Do not use it for `sudo`, polkit or anything that grants privileges.**
+> Treat lock-screen unlock as a convenience that gives no real protection.
+> Measure your own unit with `tools/verify-test.sh` (see
+> [tools/README.md](tools/README.md)).
+
 ## Read this first
 
 - **Flashing is irreversible.** The sensor's factory TLS key is replaced with a
@@ -24,13 +38,12 @@ Tested on one XPS 13 9310 2-in-1 with Ubuntu 26.10 and GNOME.
   writes it back. If that is interrupted, the sensor stays in bootloader mode.
   Running the flasher again normally resumes from there, but there is no
   guarantee. Do not suspend or unplug the laptop while it runs.
-- **The sensor is tiny (64×80 pixels) and matching is weak.** In our tests
-  about **1 in 2** touches of the enrolled finger was accepted, so expect to
-  touch again sometimes. No touch of another finger was accepted (24 tries,
-  best score 3 against a threshold of 10). That is a small test on one person.
-  Use the fingerprint as a convenience for unlocking, not as strong security.
+- **The sensor is tiny (64×80 pixels) and matching is weak**, both ways. About
+  1 in 3 touches of your enrolled finger is rejected, and about 1 in 4 touches
+  of other fingers is accepted (see the warning above). An earlier offline
+  estimate, with no impostor accepted, turned out to be far too optimistic.
   Your password keeps working everywhere. On a default Ubuntu install `sudo`
-  does not use the fingerprint.
+  does not use the fingerprint; keep it that way.
 - Unofficial and unsupported by Dell, Goodix or libfprint. Use at your own risk.
 
 ## Requirements

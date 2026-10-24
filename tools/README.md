@@ -7,6 +7,33 @@ can be re-measured on other units of the sensor.
 All of them handle **raw fingerprint images**. Keep the dumps local; the
 repository's `.gitignore` excludes `dump-dac/` and `work/`.
 
+## Measuring real-world reliability
+
+This is the measurement that matters. It goes through fprintd with the print
+you enrolled in Settings, exactly like the lock screen:
+
+```bash
+bash tools/verify-test.sh genuine 30    # the enrolled finger, one touch each
+bash tools/verify-test.sh impostor 30   # rotate through your other fingers
+```
+
+To also see the score of every comparison, enable fprintd debug logging for
+the duration of the test, then remove it:
+
+```bash
+printf '[Service]\nEnvironment=G_MESSAGES_DEBUG=all\n' | sudo tee /etc/systemd/system/fprintd.service.d/debug.conf
+sudo systemctl daemon-reload && sudo systemctl restart fprintd
+# ... run the tests, then: journalctl -u fprintd -b | grep 'sigfm score'
+sudo rm /etc/systemd/system/fprintd.service.d/debug.conf
+sudo systemctl daemon-reload && sudo systemctl restart fprintd
+```
+
+Each touch is compared with every enrolled print until one reaches the
+threshold. Group the logged scores by attempt using the timestamps in the
+`verify-*.txt` files. See docs/NOTES.md for the results on the reference unit.
+A test on 30 impostor touches cannot show a false-accept rate below about
+10%; use many more before trusting a threshold.
+
 ## Collecting frames
 
 ```bash

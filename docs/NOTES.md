@@ -71,8 +71,25 @@ Ubuntu 26.10. They explain the choices in `patches/` and `flash/`.
   matches on the same row collapse in a `std::set`. The patch adds a full
   ordering (`SIGFM_FIX_MATCH_ORDER`, enabled), which the threshold was
   measured with.
-- **Measured on one unit and one person** (16 enroll touches; 8 probe touches
-  ~15 minutes later; 24 touches of 3 other fingers): impostors scored at most
-  3, and 4 of 8 genuine probes scored ≥ 10 (10, 17, 95, 911). Threshold: 10.
-  This is a small sample. Treat the reader as a convenience for unlocking,
-  not as strong authentication.
+- **Offline estimate** (tools/sigfm-eval, one unit, one person): 16 enroll
+  touches, 8 probe touches ~15 minutes later, 24 touches of 3 other fingers.
+  Impostors scored at most 3; 4 of 8 genuine probes scored ≥ 10 (10, 17, 95,
+  911). That set the threshold to 10.
+- **Real use, through fprintd** (tools/verify-test.sh). The print was
+  enrolled in GNOME Settings, 15 stages. There were 30 touches of the
+  enrolled finger and 30 touches of six other fingers of the same person,
+  with G_MESSAGES_DEBUG=all so that fprintd logs every `sigfm score`.
+  - Enrolled finger: 19/30 accepted (63%). Scores of accepted touches were
+    10–2115; rejected touches had a best score of 0–8.
+  - Other fingers: **7/30 accepted (23%)**, with scores 10, 11, 12, 14, 16,
+    64 and 134. Rejected touches scored 0–6.
+  - The offline test badly underestimated impostors, so do not tune on it
+    alone.
+  - The genuine and impostor ranges overlap. Rejecting all 7 impostors would
+    need a threshold above 134, which only about 5 of 30 genuine touches
+    reached. Accepted scores are a lower bound, because libfprint stops at
+    the first enrolled print over the threshold.
+  - **Conclusion: with SIGFM as tuned here, the reader is not suitable for
+    authentication.** Better separation would need a different matcher or
+    much better images, and should be confirmed with verify-test.sh on many
+    more impostor touches.
