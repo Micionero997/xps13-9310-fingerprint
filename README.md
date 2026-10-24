@@ -96,6 +96,14 @@ Build libfprint with the driver (no root):
 bash scripts/build-libfprint.sh
 ```
 
+Build the patched `pam_fprintd` PAM module (no root). Without it the lock
+screen often drops the fingerprint after suspend; see
+[How it works](#how-it-works):
+
+```bash
+bash scripts/build-pam-fprintd.sh
+```
+
 Make fprintd use it:
 
 ```bash
@@ -155,9 +163,16 @@ In short:
     optional TLS-established command);
   - SIGFM from the fork's `sigfm` branch, with a match-ordering fix;
   - a core timeout fix.
-- `scripts/install-fprintd.sh` copies the built `libfprint-2.so.2` to
-  `/usr/local/lib/goodix53xd` and adds a systemd drop-in so that only fprintd
-  loads it.
+- `patches/pam_fprintd-claim-retry.patch` applies to fprintd v1.94.5. On
+  resume GNOME Shell can ask for the reader while fprintd still holds it for
+  the previous prompt; the stock module then gives up at once and GDM hides
+  the fingerprint until the next lock. The patched module waits up to 3
+  seconds for the reader instead.
+- `scripts/install-fprintd.sh` copies the built `libfprint-2.so.2` (and
+  `pam_fprintd.so`, if built) to `/usr/local/lib/goodix53xd`, adds a systemd
+  drop-in so that only fprintd loads the library, and points the lock screen
+  (`/etc/pam.d/gdm-fingerprint`, 3 tries) at the patched module. The
+  original file is kept as `gdm-fingerprint.goodix53xd-orig`.
 
 ## Credits
 

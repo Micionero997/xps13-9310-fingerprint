@@ -1,7 +1,7 @@
 diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/drivers/goodixtls/goodix53xd.c libfprint/libfprint/drivers/goodixtls/goodix53xd.c
 --- a/libfprint/drivers/goodixtls/goodix53xd.c
 +++ b/libfprint/drivers/goodixtls/goodix53xd.c
-@@ -0,0 +1,912 @@
+@@ -0,0 +1,948 @@
 +// Goodix Tls driver for libfprint: 53xd sensors (27c6:532d)
 +
 +// This library is free software; you can redistribute it and/or
@@ -79,6 +79,15 @@ diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/drivers/go
 +#define GOODIX53XD_PRESS_POLL_MS (50)
 +#define GOODIX53XD_PRESS_MAX_POLLS (10)
 +
++// The FDT thresholds come from another unit, and on this one FDT sometimes
++// fires with nothing on the sensor (seen after suspend and hibernation). Only
++// a frame covering this share of the sensor counts as a finger. Real touches
++// measured 38-100%; an empty sensor reads 0-6%. If no frame reaches it
++// within GOODIX53XD_PRESS_MAX_POLLS, the event is dropped and FDT re-armed
++// after GOODIX53XD_PHANTOM_REARM_MS, so it never costs a verify attempt.
++#define GOODIX53XD_FINGER_MIN_COVERAGE (0.15)
++#define GOODIX53XD_PHANTOM_REARM_MS (250)
++
 +struct _FpiDeviceGoodixTls53xd
 +{
 +  FpiDeviceGoodixTls5xx parent;
@@ -86,6 +95,8 @@ diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/drivers/go
 +  FpiSsm               *scan_ssm;
 +  gboolean              lifted;
 +  gboolean              pressed;
++  gboolean              finger_seen; // a frame showed a finger, reported
++  guint                 phantoms; // FDT events without a finger, per scan
 +  gint                  press_polls;
 +  gdouble               last_coverage;
 +  gint                  stable_polls;
@@ -580,12 +591,13 @@ diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/drivers/go
 +      return;
 +    }
 +
++  // Not reported as a finger yet: on_press_image() checks the frames first
 +  self->pressed = FALSE;
++  self->finger_seen = FALSE;
 +  self->press_polls = 0;
 +  self->last_coverage = 0;
 +  self->stable_polls = 0;
 +  self->best_coverage = -1;
-+  fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), TRUE);
 +  fpi_ssm_next_state (ssm);
 +}
 +
@@ -615,6 +627,14 @@ diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/drivers/go
 +      memcpy (self->best_frame, self->frame, sizeof (self->best_frame));
 +    }
 +
++  if (!self->finger_seen && coverage >= GOODIX53XD_FINGER_MIN_COVERAGE)
++    {
++      self->finger_seen = TRUE;
++      // Give the finger the full window to settle from here
++      self->press_polls = 0;
++      fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), TRUE);
++    }
++
 +  self->press_polls++;
 +  if (coverage >= GOODIX53XD_PRESS_MIN_COVERAGE &&
 +      ABS (coverage - self->last_coverage) < GOODIX53XD_PRESS_STABLE_DELTA)
@@ -638,14 +658,28 @@ diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/drivers/go
 +      return;
 +    }
 +
-+  if (self->pressed)
-+    fpi_ssm_next_state (ssm);
-+  else
++  if (!self->pressed)
 +    {
 +      self->scan_delayed = TRUE;
 +      fpi_ssm_jump_to_state_delayed (ssm, SCAN_REG_ON,
 +                                     GOODIX53XD_PRESS_POLL_MS);
++      return;
 +    }
++
++  if (self->finger_seen)
++    {
++      fpi_ssm_next_state (ssm);
++      return;
++    }
++
++  // FDT fired but no frame showed a finger: drop it and wait again
++  self->phantoms++;
++  fp_dbg ("No finger after FDT (best coverage %.0f%%, %u so far), re-arming",
++          self->best_coverage * 100, self->phantoms);
++  update_background (self);
++  self->scan_delayed = TRUE;
++  fpi_ssm_jump_to_state_delayed (ssm, SCAN_FDT_MODE,
++                                 GOODIX53XD_PHANTOM_REARM_MS);
 +}
 +
 +static void
@@ -697,6 +731,7 @@ diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/drivers/go
 +  switch (fpi_ssm_get_cur_state (ssm))
 +    {
 +    case SCAN_FDT_MODE:
++      FPI_DEVICE_GOODIXTLS53XD (dev)->scan_delayed = FALSE;
 +      send_fdt (dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_MODE, goodix_53xd_fdt_mode,
 +                FALSE, GOODIX_TIMEOUT, ssm);
 +      break;
@@ -843,6 +878,7 @@ diff -ruN -x build -x __pycache__ -x '*.pyc' libfprint.orig/libfprint/drivers/go
 +      return;
 +    }
 +
++  self->phantoms = 0;
 +  self->scan_ssm = fpi_ssm_new (FP_DEVICE (img_dev), scan_run_state,
 +                                SCAN_NUM_STATES);
 +  fpi_ssm_start (self->scan_ssm, scan_complete);

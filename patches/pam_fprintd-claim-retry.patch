@@ -1,0 +1,86 @@
+pam_fprintd: wait for the device instead of failing when it is busy
+
+On resume GNOME Shell can restart its gdm-fingerprint conversation while
+fprintd still holds the device for the old one. Claim then fails with
+net.reactivated.Fprint.Error.AlreadyInUse, pam_fprintd returns
+PAM_AUTHINFO_UNAVAIL, and GDM drops fingerprint for the whole unlock prompt:
+only the password is left. Retry the claim for up to 3 seconds.
+
+Applies to fprintd v1.94.5 (commit b54a007c).
+
+--- a/pam/pam_fprintd.c
++++ b/pam/pam_fprintd.c
+@@ -77,6 +77,10 @@
+ #define DEFAULT_TIMEOUT 30
+ #define MIN_TIMEOUT 1
+ 
++/* How long to wait for a device that another client still holds */
++#define CLAIM_RETRY_INTERVAL_MS 100
++#define CLAIM_RETRY_TOTAL_MS 3000
++
+ #define DEBUG_MATCH "debug="
+ #define MAX_TRIES_MATCH "max-tries="
+ #define TIMEOUT_MATCH "timeout="
+@@ -708,24 +712,47 @@
+               const char   *dev,
+               const char   *username)
+ {
+-  pf_auto (sd_bus_error) error = SD_BUS_ERROR_NULL;
++  unsigned waited_ms = 0;
+ 
+-  if (sd_bus_call_method (bus,
+-                          "net.reactivated.Fprint",
+-                          dev,
+-                          "net.reactivated.Fprint.Device",
+-                          "Claim",
+-                          &error,
+-                          NULL,
+-                          "s",
+-                          username) < 0)
++  for (;;)
+     {
+-      if (debug)
+-        pam_syslog (pamh, LOG_DEBUG, "failed to claim device %s", error.message);
+-      return false;
+-    }
++      pf_auto (sd_bus_error) error = SD_BUS_ERROR_NULL;
++
++      if (sd_bus_call_method (bus,
++                              "net.reactivated.Fprint",
++                              dev,
++                              "net.reactivated.Fprint.Device",
++                              "Claim",
++                              &error,
++                              NULL,
++                              "s",
++                              username) >= 0)
++        {
++          if (waited_ms > 0)
++            pam_syslog (pamh, LOG_NOTICE,
++                        "claimed device after waiting %u ms for another client",
++                        waited_ms);
++          return true;
++        }
+ 
+-  return true;
++      /* On resume GNOME Shell can restart its fingerprint conversation
++       * while fprintd still holds the device for the old one. Failing here
++       * returns PAM_AUTHINFO_UNAVAIL, and GDM then drops fingerprint for the
++       * whole unlock prompt. The old client goes away within milliseconds,
++       * so wait for it. */
++      if (!sd_bus_error_has_name (&error, "net.reactivated.Fprint.Error.AlreadyInUse") ||
++          waited_ms >= CLAIM_RETRY_TOTAL_MS)
++        {
++          if (debug || waited_ms > 0)
++            pam_syslog (pamh, debug ? LOG_DEBUG : LOG_NOTICE,
++                        "failed to claim device after %u ms: %s",
++                        waited_ms, error.message);
++          return false;
++        }
++
++      usleep (CLAIM_RETRY_INTERVAL_MS * 1000);
++      waited_ms += CLAIM_RETRY_INTERVAL_MS;
++    }
+ }
+ 
+ static int
