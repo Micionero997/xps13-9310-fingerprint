@@ -30,10 +30,21 @@ Tested on one XPS 13 9310 2-in-1 with Ubuntu 26.10 and GNOME.
 
 ## Read this first
 
-- **Flashing is irreversible.** The sensor's factory TLS key is replaced with a
-  publicly known one. The original key cannot be restored, and the Windows
-  fingerprint driver will not work with the sensor afterwards. If you dual-boot
-  and use Windows Hello, stop here.
+- **Flashing replaces the sensor's TLS key, and dual boot with Windows
+  conflicts.** The key on the sensor was most likely written by the Windows
+  Goodix driver, which keeps it inside that Windows install. The flasher
+  replaces it with a publicly known key, and the old key cannot be restored.
+  On similar Goodix sensors, the Windows driver pairs the sensor again with a
+  new key of its own the next time Windows boots
+  ([538d](https://github.com/jvsena42/dell-goodix-538d-linux/issues/7),
+  [HTK32](https://www.problemofnetwork.com/posts/goodix-htk32-omarchy/)), so
+  Windows Hello will probably work again. *This has not been verified on the
+  532d.* After that, this Linux driver refuses the sensor (its key check
+  fails) until you run the flasher again, and the next Windows boot takes the
+  sensor back. A Windows
+  update could also change the sensor firmware: the flasher only supports
+  `GF5298_GM168SEC_APP_13016` and stops, without changes, on any other version.
+  If you dual-boot and rely on Windows Hello, think twice.
 - **It can brick the sensor.** The flasher erases the sensor application and
   writes it back. If that is interrupted, the sensor stays in bootloader mode.
   Running the flasher again normally resumes from there, but there is no

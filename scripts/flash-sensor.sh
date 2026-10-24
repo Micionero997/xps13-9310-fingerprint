@@ -1,7 +1,9 @@
 #!/bin/bash
 # Reflash the Goodix 27c6:532d with a known (all-zero) TLS PSK, so that
-# libfprint can talk to it. IRREVERSIBLE: the factory PSK is lost and the
-# Windows driver will no longer work with the sensor. Read README.md first.
+# libfprint can talk to it. The previous PSK (most likely written by the
+# Windows driver) cannot be restored. Booting Windows will probably re-pair
+# the sensor with a new key and break this driver until you flash again.
+# Read README.md first.
 #
 # Run with sudo: sudo bash scripts/flash-sensor.sh [--dry-run]
 #   --dry-run  only read firmware version and PSK state, change nothing

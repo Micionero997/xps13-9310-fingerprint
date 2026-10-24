@@ -11,8 +11,14 @@ Ubuntu 26.10. They explain the choices in `patches/` and `flash/`.
   `MILAN_GM168SEC_IAP_10007`, the same family goodix-fp-dump calls 53xd.
 - Image: 64 wide × 80 tall, 12-bit, 4 pixels packed in 6 bytes; the
   decrypted frame is 7680 bytes plus a 4-byte trailer.
-- Frames are TLS-PSK encrypted. The factory PSK is unknown, so the sensor
-  has to be reflashed with a known one (`flash/`).
+- Frames are TLS-PSK encrypted. The PSK on a used sensor is unknown (on
+  similar Goodix sensors the Windows driver generates it and keeps it in the
+  Windows install), so the sensor has to be reflashed with a known one
+  (`flash/`). The sensor reports only a hash of the PMK
+  (`PRESET_PSK_READ`, flags `0xbb020001`), never the key itself. Booting
+  Windows will probably re-provision a new PSK, but this is not verified on
+  532d. The driver then refuses the sensor ("Sensor PSK is not the one
+  flashed by goodix-fp-dump") until it is flashed again.
 
 ## Protocol quirks
 
