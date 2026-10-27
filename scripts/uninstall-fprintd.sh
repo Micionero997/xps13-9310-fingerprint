@@ -11,7 +11,7 @@ gdm_pam=/etc/pam.d/gdm-fingerprint
 if [ -e "$gdm_pam.goodix53xd-orig" ]; then
   mv "$gdm_pam.goodix53xd-orig" "$gdm_pam"
 elif [ -f "$gdm_pam" ]; then
-  sed -i -E 's|/usr/local/lib/goodix53xd/pam_fprintd\.so max-tries=3$|pam_fprintd.so|' "$gdm_pam"
+  sed -i -E 's|/usr/local/lib/goodix53xd/pam_fprintd\.so max-tries=3( timeout=-1)?$|pam_fprintd.so|' "$gdm_pam"
 fi
 
 rm -f /etc/systemd/system/fprintd.service.d/goodix53xd.conf
