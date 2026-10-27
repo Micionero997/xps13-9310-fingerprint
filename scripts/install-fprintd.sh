@@ -33,11 +33,13 @@ rm -rf "$old_dump"
 
 # Lock screen: use pam_fprintd with the claim retry (build-pam-fprintd.sh),
 # so a busy device on resume does not drop fingerprint from the unlock
-# prompt. Three tries, the fprintd default, written out.
+# prompt. Three tries, the fprintd default, written out. No timeout: when it
+# expires GDM drops fingerprint until the next lock, and the password field
+# works in parallel anyway. Also updates a line from an earlier install.
 if [ -f "$pam_module" ] && [ -f "$gdm_pam" ]; then
   install -m 644 "$pam_module" "$dest/pam_fprintd.so"
   [ -e "$gdm_pam.goodix53xd-orig" ] || cp -p "$gdm_pam" "$gdm_pam.goodix53xd-orig"
-  sed -i -E "s|^(auth[[:space:]]+required[[:space:]]+)pam_fprintd\.so.*$|\1$dest/pam_fprintd.so max-tries=3|" "$gdm_pam"
+  sed -i -E "s#^(auth[[:space:]]+required[[:space:]]+)(pam_fprintd|$dest/pam_fprintd)\.so.*\$#\1$dest/pam_fprintd.so max-tries=3 timeout=-1#" "$gdm_pam"
   grep -q "^auth.*$dest/pam_fprintd.so" "$gdm_pam" ||
     echo "warning: no 'auth required pam_fprintd.so' line in $gdm_pam, left unchanged" >&2
 else

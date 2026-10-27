@@ -171,7 +171,9 @@ In short:
 - `scripts/install-fprintd.sh` copies the built `libfprint-2.so.2` (and
   `pam_fprintd.so`, if built) to `/usr/local/lib/goodix53xd`, adds a systemd
   drop-in so that only fprintd loads the library, and points the lock screen
-  (`/etc/pam.d/gdm-fingerprint`, 3 tries) at the patched module. The
+  (`/etc/pam.d/gdm-fingerprint`) at the patched module with 3 tries and no
+  timeout. With the default 30-second timeout GDM drops the fingerprint
+  until the next lock; the password field works alongside it anyway. The
   original file is kept as `gdm-fingerprint.goodix53xd-orig`.
 
 ## Credits
